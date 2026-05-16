@@ -83,7 +83,7 @@ pub struct Arguments {
     /// A number between 0 and 100 expressing how much to compress the output image.
     /// For lossy output formats such as jpeg, this affects the quality of the resulting image.
     /// 0 means less compression, 100 means more compression.
-    /// Currently affects only the JPEG and PNG encoders.
+    /// Currently affects the JPEG, PNG, and JXL encoders.
     #[arg(long, default_value = "5")]
     pub compression: u8,
 

@@ -51,6 +51,13 @@ fn encoder_for_name(
             size,
             quality,
         )?))
+    } else if extension == "jxl" {
+        debug!("Using the jxl encoder with a quality of {quality}");
+        Ok(Box::new(canvas::Canvas::<Rgba<u8>>::new_jxl_rgba(
+            destination,
+            size,
+            quality,
+        )?))
     } else {
         debug!(
             "Using the generic canvas implementation {}",

@@ -30,6 +30,51 @@ pub async fn custom_size_local_zoomify_tiles() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+pub async fn local_zoomify_tiles_to_jxl() {
+    let workspace_root = get_workspace_root();
+    let input_path = workspace_root.join("testdata/zoomify/test_custom_size/ImageProperties.xml");
+    let expected_path =
+        workspace_root.join("testdata/zoomify/test_custom_size/expected_result.jpg");
+
+    let mut args: Arguments = Default::default();
+    args.input_uri = Some(input_path.to_string_lossy().to_string());
+    args.largest = true;
+    args.retries = 0;
+    args.logging = "error".into();
+    args.compression = 10; // moderate compression (quality 90)
+
+    let tmp_file = TmpFile("test_zoomify_jxl.jxl");
+    let output_path = tmp_file.to_path_buf();
+    args.outfile = Some(output_path.clone());
+
+    dezoomify(&args).await.expect("Dezooming to JXL failed");
+
+    assert!(output_path.exists(), "JXL output file should exist");
+
+    let file_metadata = std::fs::metadata(&output_path).unwrap();
+    assert!(
+        file_metadata.len() > 1000,
+        "JXL output should be reasonably sized (got {} bytes)",
+        file_metadata.len()
+    );
+
+    let bytes = std::fs::read(&output_path).unwrap();
+    assert_eq!(
+        &bytes[..2],
+        &[0xFF, 0x0A],
+        "JXL output should have correct magic bytes"
+    );
+
+    // Verify JXL has correct dimensions via jxl-oxide
+    let jxl_image = jxl_oxide::JxlImage::builder()
+        .open(&output_path)
+        .unwrap();
+    let expected_img = image::open(&expected_path).unwrap();
+    assert_eq!(jxl_image.width(), expected_img.width());
+    assert_eq!(jxl_image.height(), expected_img.height());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 pub async fn local_generic_tiles() {
     // Get absolute path to avoid working directory issues
     let workspace_root = get_workspace_root();
@@ -42,6 +87,47 @@ pub async fn local_generic_tiles() {
     )
     .await
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn local_generic_tiles_to_jxl() {
+    let workspace_root = get_workspace_root();
+    let input_path = workspace_root.join("testdata/generic/map_{{X}}_{{Y}}.jpg");
+    let expected_path = workspace_root.join("testdata/generic/map_expected.png");
+
+    let mut args: Arguments = Default::default();
+    args.input_uri = Some(input_path.to_string_lossy().to_string());
+    args.largest = true;
+    args.retries = 0;
+    args.logging = "error".into();
+    args.compression = 10;
+
+    let tmp_file = TmpFile("test_generic_jxl.jxl");
+    let output_path = tmp_file.to_path_buf();
+    args.outfile = Some(output_path.clone());
+
+    dezoomify(&args).await.expect("Dezooming generic tiles to JXL failed");
+
+    assert!(output_path.exists(), "JXL output file should exist");
+    assert!(
+        std::fs::metadata(&output_path).unwrap().len() > 1000,
+        "JXL output should be reasonably sized"
+    );
+
+    let bytes = std::fs::read(&output_path).unwrap();
+    assert_eq!(&bytes[..2], &[0xFF, 0x0A], "JXL magic bytes");
+    // Verify dimensions match expected via djxl
+    let output = std::process::Command::new("djxl")
+        .arg(&output_path)
+        .arg(&output_path.with_extension("png"))
+        .output()
+        .expect("djxl should be available to decode JXL");
+    assert!(output.status.success(), "djxl decoding failed: {:?}", String::from_utf8_lossy(&output.stderr));
+
+    let decoded = image::open(&output_path.with_extension("png")).unwrap();
+    let expected = image::open(&expected_path).unwrap();
+    assert_eq!(decoded.dimensions(), expected.dimensions());
+    assert_images_equal(decoded, expected);
 }
 
 #[tokio::test(flavor = "multi_thread")]
