@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use image::{self, DynamicImage, GenericImageView};
 use image_hasher::HasherConfig;
+use jpegxl_rs::image::ToDynamic;
 use tempfile::Builder as TempDirBuilder;
 
 use dezoomify_rs::{Arguments, ZoomError, dezoomify, process_bulk};
@@ -65,13 +66,15 @@ pub async fn local_zoomify_tiles_to_jxl() {
         "JXL output should have correct magic bytes"
     );
 
-    // Verify JXL has correct dimensions via jxl-oxide
-    let jxl_image = jxl_oxide::JxlImage::builder()
-        .open(&output_path)
+    let decoded = jpegxl_rs::decoder_builder()
+        .build()
+        .unwrap()
+        .decode_to_image(&bytes)
+        .unwrap()
         .unwrap();
-    let expected_img = image::open(&expected_path).unwrap();
-    assert_eq!(jxl_image.width(), expected_img.width());
-    assert_eq!(jxl_image.height(), expected_img.height());
+    let expected = image::open(&expected_path).unwrap();
+    assert_eq!(decoded.dimensions(), expected.dimensions());
+    assert_images_equal(decoded, expected);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,15 +119,13 @@ pub async fn local_generic_tiles_to_jxl() {
 
     let bytes = std::fs::read(&output_path).unwrap();
     assert_eq!(&bytes[..2], &[0xFF, 0x0A], "JXL magic bytes");
-    // Verify dimensions match expected via djxl
-    let output = std::process::Command::new("djxl")
-        .arg(&output_path)
-        .arg(&output_path.with_extension("png"))
-        .output()
-        .expect("djxl should be available to decode JXL");
-    assert!(output.status.success(), "djxl decoding failed: {:?}", String::from_utf8_lossy(&output.stderr));
 
-    let decoded = image::open(&output_path.with_extension("png")).unwrap();
+    let decoded = jpegxl_rs::decoder_builder()
+        .build()
+        .unwrap()
+        .decode_to_image(&bytes)
+        .unwrap()
+        .unwrap();
     let expected = image::open(&expected_path).unwrap();
     assert_eq!(decoded.dimensions(), expected.dimensions());
     assert_images_equal(decoded, expected);

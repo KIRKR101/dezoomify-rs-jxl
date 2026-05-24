@@ -11,9 +11,13 @@ homepage = "https://lovasoa.github.io/dezoomify-rs/"
 readme = "README.md"
 keywords = ["image", "download"]
 
+[features]
+default = ["vendored-jxl"]
+vendored-jxl = ["jpegxl-rs/vendored"]
+
 [dependencies]
 image = "0.25"
-jxl-encoder = { version = "0.3", default-features = false, features = ["std", "parallel", "butteraugli-loop"] }
+jpegxl-rs = { version = "0.14", features = ["image"] }
 png = "0.18"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -48,7 +52,6 @@ reqwest = { version = "0.13", features = ["gzip", "zstd"] }
 criterion = "0.8"
 image_hasher = "3"
 tempfile = "3"
-jxl-oxide = { version = "0.12", features = ["image"] }
 
 [[bench]]
 name = "local_dezoomifying"

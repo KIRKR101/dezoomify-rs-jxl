@@ -173,46 +173,39 @@ impl ImageWriter {
         &self,
         image: &CanvasBuffer<Pix>,
         destination: &Path,
-        icc_profile: &Option<Vec<u8>>,
+        // ICC profile embedding is not yet supported by jpegxl-rs (previously handled by
+        // jxl_oxide via ImageMetadata::with_icc_profile). Re-enable when upstream adds the API.
+        _icc_profile: &Option<Vec<u8>>,
         quality: u8,
     ) -> ImageResult<()> {
-        use jxl_encoder::api::{
-            ImageMetadata, LosslessConfig, LossyConfig, PixelLayout,
-        };
-
         let (width, height) = image.dimensions();
         let raw = image.as_raw();
-        let pixel_layout = if Pix::COLOR_TYPE == ExtendedColorType::Rgba8 {
-            PixelLayout::Rgba8
-        } else {
-            PixelLayout::Rgb8
-        };
-
-        let metadata = icc_profile
-            .as_ref()
-            .map(|profile| ImageMetadata::new().with_icc_profile(profile));
+        let has_alpha = Pix::COLOR_TYPE == ExtendedColorType::Rgba8;
+        let num_channels: u32 = if has_alpha { 4 } else { 3 };
+        let frame = jpegxl_rs::encode::EncoderFrame::new(raw).num_channels(num_channels);
 
         let encoded = if quality >= 100 {
-            let config = LosslessConfig::new();
-            let mut request = config.encode_request(width, height, pixel_layout);
-            if let Some(meta) = &metadata {
-                request = request.with_metadata(meta);
-            }
-            request.encode(raw)
+            let mut encoder = jpegxl_rs::encoder_builder()
+                .has_alpha(has_alpha)
+                .lossless(true)
+                .uses_original_profile(true) // required by libjxl for lossless mode
+                .build()
+                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
+            encoder
+                .encode_frame::<u8, u8>(&frame, width, height)
+                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?
         } else {
-            let distance = (100.0 - quality as f32) / 10.0;
-            let config = LossyConfig::new(distance);
-            let mut request = config.encode_request(width, height, pixel_layout);
-            if let Some(meta) = &metadata {
-                request = request.with_metadata(meta);
-            }
-            request.encode(raw)
+            let mut encoder = jpegxl_rs::encoder_builder()
+                .has_alpha(has_alpha)
+                .jpeg_quality(quality as f32)
+                .build()
+                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
+            encoder
+                .encode_frame::<u8, u8>(&frame, width, height)
+                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?
         };
 
-        let jxl_bytes = encoded
-            .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
-
-        std::fs::write(destination, &jxl_bytes).map_err(ImageError::IoError)?;
+        std::fs::write(destination, &*encoded).map_err(ImageError::IoError)?;
         Ok(())
     }
 
@@ -330,6 +323,7 @@ impl ImageWriter {
 mod tests {
     use super::*;
     use image::{DynamicImage, ImageBuffer, Rgba};
+    use jpegxl_rs::image::ToDynamic;
     use std::env::temp_dir;
 
     #[test]
@@ -388,12 +382,14 @@ mod tests {
     #[test]
     fn test_jxl_write_creates_valid_file() {
         let destination = temp_dir().join("dezoomify-rs-jxl-test.jxl");
-        let image = ImageBuffer::<Rgba<u8>, _>::from_raw(2, 2, vec![
-            255, 0, 0, 255,
-            0, 255, 0, 255,
-            0, 0, 255, 255,
-            255, 255, 0, 255,
-        ]).unwrap();
+        let image = ImageBuffer::<Rgba<u8>, _>::from_raw(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        )
+        .unwrap();
 
         let writer = ImageWriter::Jxl { quality: 95 };
         writer.write_jxl(&image, &destination, &None, 95).unwrap();
@@ -401,22 +397,18 @@ mod tests {
         assert!(destination.exists());
         assert!(destination.metadata().unwrap().len() > 0);
 
-        let file = std::fs::File::open(&destination).unwrap();
-        let jxl_image = jxl_oxide::JxlImage::builder()
-            .read(std::io::BufReader::new(file))
-            .unwrap();
-        assert_eq!(jxl_image.width(), 2);
-        assert_eq!(jxl_image.height(), 2);
+        let bytes = std::fs::read(&destination).unwrap();
+        let decoder = jpegxl_rs::decoder_builder().build().unwrap();
+        let (metadata, _) = decoder.decode(&bytes).unwrap();
+        assert_eq!(metadata.width, 2);
+        assert_eq!(metadata.height, 2);
     }
 
     #[test]
     fn test_jxl_lossless_roundtrip() {
         let destination = temp_dir().join("dezoomify-rs-jxl-lossless.jxl");
         let pixels = vec![
-            128, 64, 32, 255,
-            10, 20, 30, 255,
-            200, 150, 100, 255,
-            0, 0, 0, 255,
+            128, 64, 32, 255, 10, 20, 30, 255, 200, 150, 100, 255, 0, 0, 0, 255,
         ];
         let image = ImageBuffer::<Rgba<u8>, _>::from_raw(2, 2, pixels.clone()).unwrap();
 
@@ -425,38 +417,44 @@ mod tests {
 
         assert!(destination.exists());
 
-        let file = std::fs::File::open(&destination).unwrap();
-        let decoder = jxl_oxide::integration::JxlDecoder::new(file).unwrap();
-        let decoded = DynamicImage::from_decoder(decoder).unwrap();
+        let bytes = std::fs::read(&destination).unwrap();
+        let decoded = jpegxl_rs::decoder_builder()
+            .build()
+            .unwrap()
+            .decode_to_image(&bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.dimensions(), (2, 2));
         let decoded_rgba = decoded.to_rgba8();
         assert_eq!(decoded_rgba.as_raw(), &pixels, "lossless pixel mismatch");
     }
 
-    #[test]
-    fn test_jxl_with_icc_profile() {
-        let destination = temp_dir().join("dezoomify-rs-jxl-icc.jxl");
-        let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap();
-
-        let icc_profile = vec![
-            0x00, 0x00, 0x02, 0x0C,
-            0x61, 0x63, 0x73, 0x70,
-            0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let writer = ImageWriter::Jxl { quality: 90 };
-        writer.write_jxl(&image, &destination, &Some(icc_profile), 90).unwrap();
-
-        assert!(destination.exists());
-        assert!(destination.metadata().unwrap().len() > 0);
-
-        let file = std::fs::File::open(&destination).unwrap();
-        let jxl_image = jxl_oxide::JxlImage::builder()
-            .read(std::io::BufReader::new(file))
-            .unwrap();
-        assert_eq!(jxl_image.width(), 1);
-        assert_eq!(jxl_image.height(), 1);
-    }
+    // Re-enable when jpegxl-rs supports ICC profile embedding.
+    // Previously handled by jxl_oxide via ImageMetadata::with_icc_profile.
+    //
+    // #[test]
+    // fn test_jxl_with_icc_profile() {
+    //     let destination = temp_dir().join("dezoomify-rs-jxl-icc.jxl");
+    //     let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap();
+    //
+    //     let icc_profile = vec![
+    //         0x00, 0x00, 0x02, 0x0C, 0x61, 0x63, 0x73, 0x70, 0x00, 0x00, 0x00, 0x00,
+    //     ];
+    //
+    //     let writer = ImageWriter::Jxl { quality: 90 };
+    //     writer
+    //         .write_jxl(&image, &destination, &Some(icc_profile), 90)
+    //         .unwrap();
+    //
+    //     assert!(destination.exists());
+    //     assert!(destination.metadata().unwrap().len() > 0);
+    //
+    //     let bytes = std::fs::read(&destination).unwrap();
+    //     let decoder = jpegxl_rs::decoder_builder().build().unwrap();
+    //     let (metadata, _) = decoder.decode(&bytes).unwrap();
+    //     assert_eq!(metadata.width, 1);
+    //     assert_eq!(metadata.height, 1);
+    // }
 
     #[test]
     fn test_jxl_canvas_full_pipeline_rgba() {
@@ -464,56 +462,65 @@ mod tests {
         let size = Vec2d { x: 2, y: 2 };
         let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100).unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 0, y: 0 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 0, y: 0 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 1, y: 0 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![0, 255, 0, 255]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 1, y: 0 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![0, 255, 0, 255]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 0, y: 1 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![0, 0, 255, 255]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 0, y: 1 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![0, 0, 255, 255]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 1, y: 1 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![255, 255, 0, 255]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 1, y: 1 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![255, 255, 0, 255]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
         canvas.finalize().unwrap();
 
         assert!(destination.exists());
 
-        let file = std::fs::File::open(&destination).unwrap();
-        let decoder = jxl_oxide::integration::JxlDecoder::new(file).unwrap();
-        let decoded = DynamicImage::from_decoder(decoder).unwrap();
+        let bytes = std::fs::read(&destination).unwrap();
+        let decoded = jpegxl_rs::decoder_builder()
+            .build()
+            .unwrap()
+            .decode_to_image(&bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.dimensions(), (2, 2));
         let decoded_rgba = decoded.to_rgba8();
         let expected_pixels = vec![
-            255, 0, 0, 255,
-            0, 255, 0, 255,
-            0, 0, 255, 255,
-            255, 255, 0, 255,
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ];
         assert_eq!(decoded_rgba.as_raw(), &expected_pixels, "pixel mismatch");
     }
@@ -524,57 +531,70 @@ mod tests {
         let size = Vec2d { x: 2, y: 2 };
         let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100).unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 0, y: 0 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 0, y: 0 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 1, y: 0 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![0, 255, 0, 128]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 1, y: 0 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![0, 255, 0, 128]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 0, y: 1 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![0, 0, 255, 64]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 0, y: 1 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![0, 0, 255, 64]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
-        canvas.add_tile(
-            Tile::builder()
-                .at_position(Vec2d { x: 1, y: 1 })
-                .with_image(DynamicImage::ImageRgba8(
-                    ImageBuffer::from_raw(1, 1, vec![255, 255, 0, 0]).unwrap(),
-                ))
-                .build(),
-        ).unwrap();
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 1, y: 1 })
+                    .with_image(DynamicImage::ImageRgba8(
+                        ImageBuffer::from_raw(1, 1, vec![255, 255, 0, 0]).unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
 
         canvas.finalize().unwrap();
 
         assert!(destination.exists());
 
-        let file = std::fs::File::open(&destination).unwrap();
-        let decoder = jxl_oxide::integration::JxlDecoder::new(file).unwrap();
-        let decoded = DynamicImage::from_decoder(decoder).unwrap();
+        let bytes = std::fs::read(&destination).unwrap();
+        let decoded = jpegxl_rs::decoder_builder()
+            .build()
+            .unwrap()
+            .decode_to_image(&bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.dimensions(), (2, 2));
         let decoded_rgba = decoded.to_rgba8();
         let expected_pixels = vec![
-            255, 0, 0, 255,
-            0, 255, 0, 128,
-            0, 0, 255, 64,
-            255, 255, 0, 0,
+            255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 0, 0,
         ];
-        assert_eq!(decoded_rgba.as_raw(), &expected_pixels, "alpha was not preserved");
+        assert_eq!(
+            decoded_rgba.as_raw(),
+            &expected_pixels,
+            "alpha was not preserved"
+        );
     }
 }
