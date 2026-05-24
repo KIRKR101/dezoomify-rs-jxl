@@ -511,7 +511,7 @@ async fn test_bulk_mode_uses_image_titles_for_iiif_manifest() {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "jpg") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "jxl") {
                 Some(path)
             } else {
                 None

@@ -22,7 +22,7 @@ pub fn get_outname(
     // An image can be encoded as JPEG only if both its dimensions can be encoded as u16
     let fits_in_jpg = size.map(|Vec2d { x, y }| u16::try_from(x.max(y)).is_ok());
     let extension = if fits_in_jpg == Some(true) {
-        "jpg"
+        "jxl"
     } else {
         "png"
     };
@@ -74,7 +74,7 @@ pub fn get_outname(
 mod tests {
     use std::env::{current_dir, set_current_dir};
     use std::error::Error;
-    use std::fs::{File, remove_file};
+    use std::fs::{remove_file, File};
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -154,7 +154,7 @@ mod tests {
                 None,
                 Some("hello".to_string()),
                 Some(Vec2d { x: 1000, y: 1000 }),
-                base("hello.jpg"),
+                base("hello.jxl"),
             ),
             (None, Some(String::new()), None, base("dezoomified.png")),
             (None, None, None, base("dezoomified.png")),
@@ -162,7 +162,7 @@ mod tests {
                 None,
                 None,
                 Some(Vec2d { x: 1000, y: 1000 }),
-                base("dezoomified.jpg"),
+                base("dezoomified.jxl"),
             ),
             (
                 Some("test.tiff".into()),

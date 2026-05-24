@@ -4,7 +4,7 @@ use std::env::current_dir;
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::io;
 
 use log::{debug, error, info};
 use reqwest::Client;
@@ -258,7 +258,7 @@ fn prepare_output_path(
     size_hint: Option<Vec2d>,
 ) -> Result<PathBuf, ZoomError> {
     let outname = get_outname(outfile_arg, title, base_dir, size_hint);
-    let save_as = fs::canonicalize(outname.as_path()).unwrap_or_else(|_e| outname.clone());
+    let save_as = std::path::absolute(outname.as_path()).unwrap_or_else(|_e| outname.clone());
     reserve_output_file(&save_as)?;
     Ok(save_as)
 }

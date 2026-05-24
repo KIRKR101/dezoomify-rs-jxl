@@ -7,6 +7,7 @@ use crate::tile::Tile;
 use crate::{Vec2d, ZoomError, max_size_in_rect};
 
 pub mod canvas;
+pub mod jxl_encode;
 pub mod iiif_encoder;
 pub mod pixel_streamer;
 pub mod png_encoder;
@@ -52,11 +53,15 @@ fn encoder_for_name(
             quality,
         )?))
     } else if extension == "jxl" {
-        debug!("Using the jxl encoder with a quality of {quality}");
+        // JXL uses a different quality scale from JPEG (butteraugli distance).
+        // Scale compression so the default (5) produces files smaller than
+        // equivalent JPEGs while maintaining competitive quality.
+        let jxl_quality = 100u8.saturating_sub(compression.saturating_mul(4).min(95));
+        debug!("Using the jxl encoder with a quality of {jxl_quality}");
         Ok(Box::new(canvas::Canvas::<Rgba<u8>>::new_jxl_rgba(
             destination,
             size,
-            quality,
+            jxl_quality,
         )?))
     } else {
         debug!(

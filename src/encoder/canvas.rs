@@ -173,39 +173,34 @@ impl ImageWriter {
         &self,
         image: &CanvasBuffer<Pix>,
         destination: &Path,
-        // ICC profile embedding is not yet supported by jpegxl-rs (previously handled by
-        // jxl_oxide via ImageMetadata::with_icc_profile). Re-enable when upstream adds the API.
-        _icc_profile: &Option<Vec<u8>>,
+        icc_profile: &Option<Vec<u8>>,
         quality: u8,
     ) -> ImageResult<()> {
+        use crate::encoder::jxl_encode::JxlEncoder;
+
         let (width, height) = image.dimensions();
         let raw = image.as_raw();
         let has_alpha = Pix::COLOR_TYPE == ExtendedColorType::Rgba8;
-        let num_channels: u32 = if has_alpha { 4 } else { 3 };
-        let frame = jpegxl_rs::encode::EncoderFrame::new(raw).num_channels(num_channels);
+        let uses_original_profile = icc_profile.is_some() || quality >= 100;
 
-        let encoded = if quality >= 100 {
-            let mut encoder = jpegxl_rs::encoder_builder()
-                .has_alpha(has_alpha)
-                .lossless(true)
-                .uses_original_profile(true) // required by libjxl for lossless mode
-                .build()
-                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
-            encoder
-                .encode_frame::<u8, u8>(&frame, width, height)
-                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?
-        } else {
-            let mut encoder = jpegxl_rs::encoder_builder()
-                .has_alpha(has_alpha)
-                .jpeg_quality(quality as f32)
-                .build()
-                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
-            encoder
-                .encode_frame::<u8, u8>(&frame, width, height)
-                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?
-        };
+        let mut encoder =
+            JxlEncoder::create().map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
 
-        std::fs::write(destination, &*encoded).map_err(ImageError::IoError)?;
+        encoder
+            .set_basic_info(width, height, has_alpha, uses_original_profile)
+            .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
+
+        if let Some(profile) = icc_profile {
+            encoder
+                .set_icc_profile(profile)
+                .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
+        }
+
+        let encoded = encoder
+            .encode_frame(raw, has_alpha, quality as f32)
+            .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
+
+        std::fs::write(destination, &encoded).map_err(ImageError::IoError)?;
         Ok(())
     }
 
@@ -223,7 +218,7 @@ impl ImageWriter {
 
         match extension.as_str() {
             "jxl" => {
-                let quality = 95u8;
+                let quality = 80u8;
                 self.write_jxl(
                     image,
                     destination,
@@ -429,32 +424,132 @@ mod tests {
         assert_eq!(decoded_rgba.as_raw(), &pixels, "lossless pixel mismatch");
     }
 
-    // Re-enable when jpegxl-rs supports ICC profile embedding.
-    // Previously handled by jxl_oxide via ImageMetadata::with_icc_profile.
-    //
-    // #[test]
-    // fn test_jxl_with_icc_profile() {
-    //     let destination = temp_dir().join("dezoomify-rs-jxl-icc.jxl");
-    //     let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap();
-    //
-    //     let icc_profile = vec![
-    //         0x00, 0x00, 0x02, 0x0C, 0x61, 0x63, 0x73, 0x70, 0x00, 0x00, 0x00, 0x00,
-    //     ];
-    //
-    //     let writer = ImageWriter::Jxl { quality: 90 };
-    //     writer
-    //         .write_jxl(&image, &destination, &Some(icc_profile), 90)
-    //         .unwrap();
-    //
-    //     assert!(destination.exists());
-    //     assert!(destination.metadata().unwrap().len() > 0);
-    //
-    //     let bytes = std::fs::read(&destination).unwrap();
-    //     let decoder = jpegxl_rs::decoder_builder().build().unwrap();
-    //     let (metadata, _) = decoder.decode(&bytes).unwrap();
-    //     assert_eq!(metadata.width, 1);
-    //     assert_eq!(metadata.height, 1);
-    // }
+    #[test]
+    fn test_jxl_with_icc_profile() {
+        let destination = temp_dir().join("dezoomify-rs-jxl-icc.jxl");
+        let image = ImageBuffer::<Rgba<u8>, _>::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap();
+
+        let icc_profile = minimal_srgb_icc_profile();
+
+        let writer = ImageWriter::Jxl { quality: 90 };
+        writer
+            .write_jxl(&image, &destination, &Some(icc_profile), 90)
+            .unwrap();
+
+        assert!(destination.exists());
+        assert!(destination.metadata().unwrap().len() > 0);
+
+        let bytes = std::fs::read(&destination).unwrap();
+        let decoder = jpegxl_rs::decoder_builder().build().unwrap();
+        let (metadata, _) = decoder.decode(&bytes).unwrap();
+        assert_eq!(metadata.width, 1);
+        assert_eq!(metadata.height, 1);
+    }
+
+    fn minimal_srgb_icc_profile() -> Vec<u8> {
+        let mut b = Vec::new();
+
+        let w32 = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_be_bytes());
+        let s15f16 = |b: &mut Vec<u8>, v: f32| w32(b, (v * 65536.0 + 0.5) as u32);
+
+        let rxyz_off: u32 = 216;
+        let gxyz_off: u32 = 236;
+        let bxyz_off: u32 = 256;
+        let rtrc_off: u32 = 276;
+        let gtrc_off: u32 = 292;
+        let btrc_off: u32 = 308;
+        let wtpt_off: u32 = 324;
+        let total_size: u32 = wtpt_off + 20;
+
+        w32(&mut b, total_size); // [0]    profile size
+        w32(&mut b, 0x6163_7370); // [4]    'acsp'
+        w32(&mut b, 0x0210_0000); // [8]    version 2.1.0
+        w32(&mut b, 0x6D6E_7472); // [12]   'mntr' display class
+        w32(&mut b, 0x5247_4220); // [16]   'RGB '
+        w32(&mut b, 0x5859_5A20); // [20]   'XYZ ' PCS
+        b.resize(b.len() + 12, 0); // [24]   datetime
+        w32(&mut b, 0x6163_7370); // [36]   'acsp' magic
+        w32(&mut b, 0); // [40]   platform
+        w32(&mut b, 0); // [44]   flags
+        w32(&mut b, 0); // [48]   manufacturer
+        w32(&mut b, 0); // [52]   model
+        b.resize(b.len() + 8, 0); // [56]   attributes
+        w32(&mut b, 0); // [64]   intent
+        s15f16(&mut b, 0.9642); // [68]   PCS illuminant X (D50)
+        s15f16(&mut b, 1.0); // [72]   Y
+        s15f16(&mut b, 0.8249); // [76]   Z
+        w32(&mut b, 0); // [80]   creator
+        b.resize(b.len() + 16, 0); // [84]   profile ID
+        b.resize(b.len() + 28, 0); // [100]  reserved (28 bytes)
+        assert_eq!(b.len(), 128);
+
+        w32(&mut b, 7); // [128]  tag count
+
+        w32(&mut b, 0x7258_595A);
+        w32(&mut b, rxyz_off);
+        w32(&mut b, 20);
+        w32(&mut b, 0x6758_595A);
+        w32(&mut b, gxyz_off);
+        w32(&mut b, 20);
+        w32(&mut b, 0x6258_595A);
+        w32(&mut b, bxyz_off);
+        w32(&mut b, 20);
+        w32(&mut b, 0x7254_5243);
+        w32(&mut b, rtrc_off);
+        w32(&mut b, 16);
+        w32(&mut b, 0x6754_5243);
+        w32(&mut b, gtrc_off);
+        w32(&mut b, 16);
+        w32(&mut b, 0x6254_5243);
+        w32(&mut b, btrc_off);
+        w32(&mut b, 16);
+        w32(&mut b, 0x7774_7074);
+        w32(&mut b, wtpt_off);
+        w32(&mut b, 20);
+        assert_eq!(b.len(), rxyz_off as usize);
+
+        let write_xyz_tag = |b: &mut Vec<u8>, x: f32, y: f32, z: f32| {
+            w32(b, 0x5859_5A20); // 'XYZ '
+            w32(b, 0); // reserved
+            s15f16(b, x);
+            s15f16(b, y);
+            s15f16(b, z);
+        };
+
+        let write_trc_tag = |b: &mut Vec<u8>, gamma: f32| {
+            w32(b, 0x7061_7261); // 'para'
+            w32(b, 0); // reserved
+            b.extend_from_slice(&0u16.to_be_bytes()); // curve type 0
+            b.extend_from_slice(&0u16.to_be_bytes()); // reserved
+            s15f16(b, gamma); // gamma value
+        };
+
+        // sRGB primaries D50-adapted: r=0.4361,0.2225,0.0139
+        write_xyz_tag(&mut b, 0.4361, 0.2225, 0.0139);
+        assert_eq!(b.len(), gxyz_off as usize);
+
+        // g=0.3851,0.7169,0.0971
+        write_xyz_tag(&mut b, 0.3851, 0.7169, 0.0971);
+        assert_eq!(b.len(), bxyz_off as usize);
+
+        // b=0.1431,0.0606,0.7141
+        write_xyz_tag(&mut b, 0.1431, 0.0606, 0.7141);
+        assert_eq!(b.len(), rtrc_off as usize);
+
+        write_trc_tag(&mut b, 2.2);
+        assert_eq!(b.len(), gtrc_off as usize);
+
+        write_trc_tag(&mut b, 2.2);
+        assert_eq!(b.len(), btrc_off as usize);
+
+        write_trc_tag(&mut b, 2.2);
+        assert_eq!(b.len(), wtpt_off as usize);
+
+        write_xyz_tag(&mut b, 0.9642, 1.0, 0.8249); // D50 white point
+        assert_eq!(b.len(), total_size as usize);
+
+        b
+    }
 
     #[test]
     fn test_jxl_canvas_full_pipeline_rgba() {
