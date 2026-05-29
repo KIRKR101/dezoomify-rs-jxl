@@ -27,6 +27,7 @@ fn encoder_for_name(
     destination: PathBuf,
     size: Vec2d,
     compression: u8,
+    jxl_effort: Option<u8>,
 ) -> Result<Box<dyn Encoder>, ZoomError> {
     let extension = destination.extension().unwrap_or_default();
     let quality = 100u8.saturating_sub(compression);
@@ -53,15 +54,16 @@ fn encoder_for_name(
             quality,
         )?))
     } else if extension == "jxl" {
-        // JXL uses a different quality scale from JPEG (butteraugli distance).
-        // Scale compression so the default (5) produces files smaller than
-        // equivalent JPEGs while maintaining competitive quality.
-        let jxl_quality = 100u8.saturating_sub(compression.saturating_mul(4).min(95));
-        debug!("Using the jxl encoder with a quality of {jxl_quality}");
+        // JXL quality: scale compression so the default (5) produces files
+        // smaller than equivalent JPEGs while maintaining competitive quality.
+        let jxl_quality = 100u8.saturating_sub(compression.saturating_mul(4));
+        let effort = jxl_effort.unwrap_or_else(|| 1 + compression.saturating_mul(8) / 100);
+        debug!("Using the jxl encoder with quality={jxl_quality} effort={effort}");
         Ok(Box::new(canvas::Canvas::<Rgba<u8>>::new_jxl_rgba(
             destination,
             size,
             jxl_quality,
+            effort,
         )?))
     } else {
         debug!(

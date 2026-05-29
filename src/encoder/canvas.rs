@@ -1,6 +1,6 @@
 use image::{
-    ExtendedColorType, GenericImageView, ImageBuffer, ImageEncoder, ImageError, ImageResult, Pixel,
-    PixelWithColorType, Rgb, Rgba,
+    DynamicImage, ExtendedColorType, GenericImageView, ImageBuffer, ImageEncoder, ImageError,
+    ImageResult, Pixel, PixelWithColorType, Rgb, Rgba,
 };
 use log::debug;
 use std::fs::File;
@@ -18,6 +18,7 @@ pub struct Canvas<Pix: Pixel = Rgba<u8>> {
     destination: PathBuf,
     image_writer: ImageWriter,
     icc_profile: Option<Vec<u8>>,
+    exif_metadata: Option<Vec<u8>>,
 }
 
 impl<Pix: Pixel> Canvas<Pix> {
@@ -27,6 +28,7 @@ impl<Pix: Pixel> Canvas<Pix> {
             destination,
             image_writer: ImageWriter::Generic,
             icc_profile: None,
+            exif_metadata: None,
         })
     }
 
@@ -40,6 +42,7 @@ impl<Pix: Pixel> Canvas<Pix> {
             destination,
             image_writer: ImageWriter::Jpeg { quality },
             icc_profile: None,
+            exif_metadata: None,
         })
     }
 
@@ -47,64 +50,84 @@ impl<Pix: Pixel> Canvas<Pix> {
         destination: PathBuf,
         size: Vec2d,
         quality: u8,
+        effort: u8,
     ) -> Result<Canvas<Rgba<u8>>, ZoomError> {
         Ok(Canvas::<Rgba<u8>> {
             image: ImageBuffer::new(size.x, size.y),
             destination,
-            image_writer: ImageWriter::Jxl { quality },
+            image_writer: ImageWriter::Jxl { quality, effort },
             icc_profile: None,
+            exif_metadata: None,
         })
     }
 }
 
-trait FromRgba {
-    fn from_rgba(rgba: Rgba<u8>) -> Self;
-}
-
-impl FromRgba for Rgba<u8> {
-    fn from_rgba(rgba: Rgba<u8>) -> Self {
-        rgba
+/// Shared logic for capturing metadata from the first tile that has it.
+fn capture_metadata(canvas: &mut Canvas<impl Pixel>, tile: &Tile) {
+    if canvas.icc_profile.is_none() && tile.icc_profile.is_some() {
+        canvas.icc_profile = tile.icc_profile.clone();
+        debug!(
+            "Captured ICC profile from tile (size: {} bytes)",
+            canvas.icc_profile.as_ref().unwrap().len()
+        );
+    }
+    if canvas.exif_metadata.is_none() && tile.exif_metadata.is_some() {
+        canvas.exif_metadata = tile.exif_metadata.clone();
+        debug!(
+            "Captured EXIF metadata from tile (size: {} bytes)",
+            canvas.exif_metadata.as_ref().unwrap().len()
+        );
     }
 }
 
-impl FromRgba for Rgb<u8> {
-    fn from_rgba(rgba: Rgba<u8>) -> Self {
-        rgba.to_rgb()
+fn validate_tile_fit(tile: &Tile, canvas_size: Vec2d) -> io::Result<(Vec2d, Vec2d)> {
+    let min_pos = tile.position();
+    if !min_pos.fits_inside(canvas_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tile too large for image",
+        ));
     }
+    let max_pos = tile.bottom_right().min(canvas_size);
+    let size = max_pos - min_pos;
+    Ok((min_pos, size))
 }
 
-#[allow(clippy::panicking_unwrap)] // https://github.com/rust-lang/rust-clippy/issues/16188
-impl<Pix: Pixel<Subpixel = u8> + PixelWithColorType + Send + FromRgba + 'static> Encoder
-    for Canvas<Pix>
-{
+impl Encoder for Canvas<Rgba<u8>> {
     fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
         debug!("Copying tile data from {tile:?}");
+        capture_metadata(self, &tile);
 
-        // Capture ICC profile from the first tile that has one
-        if self.icc_profile.is_none() && tile.icc_profile.is_some() {
-            self.icc_profile = tile.icc_profile.clone();
-            debug!(
-                "Captured ICC profile from tile (size: {} bytes)",
-                self.icc_profile.as_ref().unwrap().len()
-            );
-        }
+        let (min_pos, size) = validate_tile_fit(&tile, self.size())?;
 
-        let min_pos = tile.position();
-        let canvas_size = self.size();
-        if !min_pos.fits_inside(canvas_size) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tile too large for image",
-            ));
-        }
-        let max_pos = tile.bottom_right().min(canvas_size);
-        let size = max_pos - min_pos;
-        for y in 0..size.y {
-            let canvas_y = y + min_pos.y;
-            for x in 0..size.x {
-                let canvas_x = x + min_pos.x;
-                let p = tile.image.get_pixel(x, y);
-                self.image.put_pixel(canvas_x, canvas_y, Pix::from_rgba(p));
+        match &tile.image {
+            DynamicImage::ImageRgba8(src) => {
+                let tile_width = src.width() as usize;
+                let dst_width = self.image.width() as usize;
+                let row_bytes = size.x as usize * 4;
+                let dst_ptr = self.image.as_mut_ptr();
+                let src_ptr = src.as_ptr();
+                for y in 0..size.y {
+                    let src_offset = (y as usize * tile_width) * 4;
+                    let dst_offset =
+                        ((min_pos.y + y) as usize * dst_width + min_pos.x as usize) * 4;
+                    // SAFETY: offsets and row_bytes are within validated bounds.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(src_offset),
+                            dst_ptr.add(dst_offset),
+                            row_bytes,
+                        );
+                    }
+                }
+            }
+            other => {
+                for y in 0..size.y {
+                    for x in 0..size.x {
+                        let p = other.get_pixel(x, y);
+                        self.image.put_pixel(x + min_pos.x, y + min_pos.y, p);
+                    }
+                }
             }
         }
         Ok(())
@@ -112,7 +135,73 @@ impl<Pix: Pixel<Subpixel = u8> + PixelWithColorType + Send + FromRgba + 'static>
 
     fn finalize(&mut self) -> io::Result<()> {
         self.image_writer
-            .write(&self.image, &self.destination, &self.icc_profile)
+            .write(
+                &self.image,
+                &self.destination,
+                &self.icc_profile,
+                &self.exif_metadata,
+            )
+            .map_err(|e| match e {
+                image::ImageError::IoError(e) => e,
+                other => io::Error::other(other),
+            })?;
+        Ok(())
+    }
+
+    fn size(&self) -> Vec2d {
+        self.image.dimensions().into()
+    }
+}
+
+impl Encoder for Canvas<Rgb<u8>> {
+    fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
+        debug!("Copying tile data from {tile:?}");
+        capture_metadata(self, &tile);
+
+        let (min_pos, size) = validate_tile_fit(&tile, self.size())?;
+
+        match &tile.image {
+            DynamicImage::ImageRgb8(src) => {
+                let tile_width = src.width() as usize;
+                let dst_width = self.image.width() as usize;
+                let row_bytes = size.x as usize * 3;
+                let dst_ptr = self.image.as_mut_ptr();
+                let src_ptr = src.as_ptr();
+                for y in 0..size.y {
+                    let src_offset = (y as usize * tile_width) * 3;
+                    let dst_offset =
+                        ((min_pos.y + y) as usize * dst_width + min_pos.x as usize) * 3;
+                    // SAFETY: offsets and row_bytes are within validated bounds.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(src_offset),
+                            dst_ptr.add(dst_offset),
+                            row_bytes,
+                        );
+                    }
+                }
+            }
+            other => {
+                for y in 0..size.y {
+                    for x in 0..size.x {
+                        let p = other.get_pixel(x, y);
+                        self.image
+                            .put_pixel(x + min_pos.x, y + min_pos.y, p.to_rgb());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        self.image_writer
+            .write(
+                &self.image,
+                &self.destination,
+                &self.icc_profile,
+                &self.exif_metadata,
+            )
             .map_err(|e| match e {
                 image::ImageError::IoError(e) => e,
                 other => io::Error::other(other),
@@ -128,7 +217,7 @@ impl<Pix: Pixel<Subpixel = u8> + PixelWithColorType + Send + FromRgba + 'static>
 pub enum ImageWriter {
     Generic,
     Jpeg { quality: u8 },
-    Jxl { quality: u8 },
+    Jxl { quality: u8, effort: u8 },
 }
 
 impl ImageWriter {
@@ -137,6 +226,7 @@ impl ImageWriter {
         image: &CanvasBuffer<Pix>,
         destination: &Path,
         icc_profile: &Option<Vec<u8>>,
+        exif_metadata: &Option<Vec<u8>>,
     ) -> ImageResult<()> {
         match *self {
             ImageWriter::Jpeg { quality } => {
@@ -160,10 +250,22 @@ impl ImageWriter {
                 )?;
             }
             ImageWriter::Generic => {
-                self.encode_with_format_dispatch(image, destination, icc_profile.as_deref())?;
+                self.encode_with_format_dispatch(
+                    image,
+                    destination,
+                    icc_profile.as_deref(),
+                    exif_metadata.as_deref(),
+                )?;
             }
-            ImageWriter::Jxl { quality } => {
-                self.write_jxl(image, destination, icc_profile, quality)?;
+            ImageWriter::Jxl { quality, effort } => {
+                self.write_jxl(
+                    image,
+                    destination,
+                    icc_profile,
+                    exif_metadata,
+                    quality,
+                    effort,
+                )?;
             }
         };
         Ok(())
@@ -174,7 +276,9 @@ impl ImageWriter {
         image: &CanvasBuffer<Pix>,
         destination: &Path,
         icc_profile: &Option<Vec<u8>>,
+        exif_metadata: &Option<Vec<u8>>,
         quality: u8,
+        effort: u8,
     ) -> ImageResult<()> {
         use crate::encoder::jxl_encode::JxlEncoder;
 
@@ -197,7 +301,7 @@ impl ImageWriter {
         }
 
         let encoded = encoder
-            .encode_frame(raw, has_alpha, quality as f32)
+            .encode_frame(raw, has_alpha, quality as f32, effort, exif_metadata.as_deref())
             .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
 
         std::fs::write(destination, &encoded).map_err(ImageError::IoError)?;
@@ -209,6 +313,7 @@ impl ImageWriter {
         image: &CanvasBuffer<Pix>,
         destination: &Path,
         icc_profile: Option<&[u8]>,
+        exif_metadata: Option<&[u8]>,
     ) -> ImageResult<()> {
         let extension = destination
             .extension()
@@ -219,11 +324,14 @@ impl ImageWriter {
         match extension.as_str() {
             "jxl" => {
                 let quality = 80u8;
+                let effort = 7u8;
                 self.write_jxl(
                     image,
                     destination,
                     &icc_profile.map(|p| p.to_vec()),
+                    &exif_metadata.map(|p| p.to_vec()),
                     quality,
+                    effort,
                 )?;
             }
             "png" => {
@@ -386,8 +494,13 @@ mod tests {
         )
         .unwrap();
 
-        let writer = ImageWriter::Jxl { quality: 95 };
-        writer.write_jxl(&image, &destination, &None, 95).unwrap();
+        let writer = ImageWriter::Jxl {
+            quality: 95,
+            effort: 7,
+        };
+        writer
+            .write_jxl(&image, &destination, &None, &None, 95, 7)
+            .unwrap();
 
         assert!(destination.exists());
         assert!(destination.metadata().unwrap().len() > 0);
@@ -407,8 +520,13 @@ mod tests {
         ];
         let image = ImageBuffer::<Rgba<u8>, _>::from_raw(2, 2, pixels.clone()).unwrap();
 
-        let writer = ImageWriter::Jxl { quality: 100 };
-        writer.write_jxl(&image, &destination, &None, 100).unwrap();
+        let writer = ImageWriter::Jxl {
+            quality: 100,
+            effort: 7,
+        };
+        writer
+            .write_jxl(&image, &destination, &None, &None, 100, 7)
+            .unwrap();
 
         assert!(destination.exists());
 
@@ -431,9 +549,12 @@ mod tests {
 
         let icc_profile = minimal_srgb_icc_profile();
 
-        let writer = ImageWriter::Jxl { quality: 90 };
+        let writer = ImageWriter::Jxl {
+            quality: 90,
+            effort: 7,
+        };
         writer
-            .write_jxl(&image, &destination, &Some(icc_profile), 90)
+            .write_jxl(&image, &destination, &Some(icc_profile), &None, 90, 7)
             .unwrap();
 
         assert!(destination.exists());
@@ -555,7 +676,7 @@ mod tests {
     fn test_jxl_canvas_full_pipeline_rgba() {
         let destination = temp_dir().join("dezoomify-rs-jxl-pipeline.jxl");
         let size = Vec2d { x: 2, y: 2 };
-        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100).unwrap();
+        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
 
         canvas
             .add_tile(
@@ -624,7 +745,7 @@ mod tests {
     fn test_jxl_rgba_alpha_preserved() {
         let destination = temp_dir().join("dezoomify-rs-jxl-alpha.jxl");
         let size = Vec2d { x: 2, y: 2 };
-        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100).unwrap();
+        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
 
         canvas
             .add_tile(

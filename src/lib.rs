@@ -264,8 +264,12 @@ fn prepare_output_path(
 }
 
 /// Creates a tile buffer for the given output path
-async fn create_tile_buffer(save_as: PathBuf, compression: u8) -> Result<TileBuffer, ZoomError> {
-    TileBuffer::new(save_as, compression).await
+async fn create_tile_buffer(
+    save_as: PathBuf,
+    compression: u8,
+    jxl_effort: Option<u8>,
+) -> Result<TileBuffer, ZoomError> {
+    TileBuffer::new(save_as, compression, jxl_effort).await
 }
 
 pub async fn dezoomify(args: &Arguments) -> Result<PathBuf, ZoomError> {
@@ -278,7 +282,8 @@ pub async fn dezoomify(args: &Arguments) -> Result<PathBuf, ZoomError> {
         &base_dir,
         zoom_level.size_hint(),
     )?;
-    let tile_buffer = create_tile_buffer(save_as.clone(), args.compression).await?;
+    let tile_buffer =
+        create_tile_buffer(save_as.clone(), args.compression, args.jxl_effort).await?;
     info!("Dezooming {}", zoom_level.name());
     dezoomify_level(args, zoom_level, tile_buffer).await?;
     Ok(save_as)
@@ -470,7 +475,13 @@ async fn process_bulk_zoomable_images(
             continue;
         };
 
-        let tile_buffer = match create_tile_buffer(save_as.clone(), args.compression).await {
+        let tile_buffer = match create_tile_buffer(
+            save_as.clone(),
+            args.compression,
+            args.jxl_effort,
+        )
+        .await
+        {
             Ok(buffer) => buffer,
             Err(e) => {
                 let file_name = save_as

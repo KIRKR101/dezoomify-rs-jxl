@@ -87,6 +87,12 @@ pub struct Arguments {
     #[arg(long, default_value = "5")]
     pub compression: u8,
 
+    /// Encoding effort for JXL output (1–9).
+    /// 1 = fastest / least compression, 9 = slowest / best compression.
+    /// When not set, effort scales with --compression.
+    #[arg(long = "jxl-effort")]
+    pub jxl_effort: Option<u8>,
+
     /// Sets an HTTP header to use on requests.
     /// This option can be repeated in order to set multiple headers.
     /// You can use `-H "Referer: URL"` where URL is the URL of the website's
@@ -160,6 +166,7 @@ impl Default for Arguments {
             parallelism: 16,
             retries: 1,
             compression: 5,
+            jxl_effort: None,
             retry_delay: Duration::from_secs(2),
             headers: vec![],
             max_idle_per_host: 32,

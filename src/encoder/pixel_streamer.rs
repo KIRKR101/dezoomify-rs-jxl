@@ -119,10 +119,13 @@ impl ImageStrip {
     ) -> io::Result<()> {
         let img = self.cropped(image_size);
         let x0 = u32::try_from(start_at).unwrap();
+        let pixel_count = (img.width() - x0) as usize;
+        let mut line_buf = Vec::with_capacity(pixel_count * BYTES_PER_PIXEL);
         for x in x0..img.width() {
             let rgb: Rgb<u8> = img.get_pixel(x, self.line).to_rgb();
-            writer.write_all(&rgb.0)?;
+            line_buf.extend_from_slice(&rgb.0);
         }
+        writer.write_all(&line_buf)?;
         Ok(())
     }
 }

@@ -35,9 +35,7 @@ pub async fn fetch_uri(uri: &str, http: &Client) -> Result<Vec<u8>, ZoomError> {
             response.headers()
         );
         let response = response.error_for_status()?;
-        let mut contents = Vec::new();
-        let bytes = response.bytes().await?;
-        contents.extend(bytes);
+        let contents = response.bytes().await?.to_vec();
         trace!(
             "Successfully finished loading url: '{}' - received {} bytes: {}",
             uri,

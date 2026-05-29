@@ -19,10 +19,11 @@ impl Throttler {
         }
         let now = Instant::now();
         let next_allowed = self.last_update + self.min_interval;
-        self.last_update = now;
-        let sleep_time = next_allowed.saturating_duration_since(now);
-        if !sleep_time.is_zero() {
-            tokio::time::sleep(sleep_time).await;
+        if next_allowed > now {
+            tokio::time::sleep(next_allowed - now).await;
+            self.last_update = next_allowed;
+        } else {
+            self.last_update = now;
         }
     }
 }

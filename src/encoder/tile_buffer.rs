@@ -17,6 +17,7 @@ pub enum TileBuffer {
         destination: PathBuf,
         buffer: Vec<Tile>,
         compression: u8,
+        jxl_effort: Option<u8>,
     },
     Writing {
         destination: PathBuf,
@@ -29,11 +30,16 @@ impl TileBuffer {
     /// Create an encoder for an image of the given size at the path
     /// Errors out if the encoder cannot create files with the given extension
     /// or at the given size
-    pub async fn new(destination: PathBuf, compression: u8) -> Result<Self, ZoomError> {
+    pub async fn new(
+        destination: PathBuf,
+        compression: u8,
+        jxl_effort: Option<u8>,
+    ) -> Result<Self, ZoomError> {
         Ok(TileBuffer::Buffering {
             destination,
             buffer: vec![],
             compression,
+            jxl_effort,
         })
     }
 
@@ -43,10 +49,13 @@ impl TileBuffer {
                 buffer,
                 destination,
                 compression,
+                jxl_effort,
             } => {
                 let destination = std::mem::take(destination);
+                let jxl_effort = *jxl_effort;
                 debug!("Creating a tile writer for an image of size {size}");
-                let mut encoder = encoder_for_name(destination.clone(), size, *compression)?;
+                let mut encoder =
+                    encoder_for_name(destination.clone(), size, *compression, jxl_effort)?;
                 debug!("Adding buffered tiles: {buffer:?}");
                 for tile in buffer.drain(..) {
                     encoder.add_tile(tile)?;

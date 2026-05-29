@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use jpegxl_sys::common::types::{JxlBool, JxlDataType, JxlEndianness, JxlPixelFormat};
+use jpegxl_sys::common::types::{JxlBool, JxlBoxType, JxlDataType, JxlEndianness, JxlPixelFormat};
 use jpegxl_sys::encoder::encode::*;
 use jpegxl_sys::metadata::codestream_header::JxlBasicInfo;
 use jpegxl_sys::threads::resizable_parallel_runner::*;
@@ -96,6 +96,8 @@ impl JxlEncoder {
         data: &[u8],
         has_alpha: bool,
         quality: f32,
+        effort: u8,
+        exif: Option<&[u8]>,
     ) -> Result<Vec<u8>, String> {
         // SAFETY: quality is a float, the C function has no safety requirements.
         let distance = unsafe { JxlEncoderDistanceFromQuality(quality) };
@@ -111,6 +113,42 @@ impl JxlEncoder {
             unsafe { JxlEncoderSetFrameDistance(frame_settings, distance) };
         }
 
+        // Map effort (1-9) from compression parameter.
+        let effort = effort.clamp(1, 9) as i64;
+        // SAFETY: frame_settings is valid, effort is in range [1, 9].
+        unsafe {
+            JxlEncoderFrameSettingsSetOption(
+                frame_settings,
+                JxlEncoderFrameSettingId::Effort,
+                effort,
+            )
+        };
+
+        // Enable progressive encoding at lower effort levels for faster
+        // preview on large images. Disable at effort >= 7 where the user
+        // wants maximum compression density over progressive decode support.
+        // (Progressive passes add ~5–15% bitstream overhead.)
+        // SAFETY: frame_settings is valid, option values are 0/1.
+        if effort < 7 {
+            unsafe {
+                JxlEncoderFrameSettingsSetOption(
+                    frame_settings,
+                    JxlEncoderFrameSettingId::ProgressiveAc,
+                    1,
+                );
+                JxlEncoderFrameSettingsSetOption(
+                    frame_settings,
+                    JxlEncoderFrameSettingId::ProgressiveDc,
+                    1,
+                );
+                JxlEncoderFrameSettingsSetOption(
+                    frame_settings,
+                    JxlEncoderFrameSettingId::QprogressiveAc,
+                    1,
+                );
+            }
+        }
+
         let num_channels: u32 = if has_alpha { 4 } else { 3 };
         let pixel_format = JxlPixelFormat {
             num_channels,
@@ -118,6 +156,12 @@ impl JxlEncoder {
             endianness: JxlEndianness::Native,
             align: 0,
         };
+
+        // Enable container format if we need to add EXIF metadata boxes.
+        if exif.is_some() {
+            // SAFETY: enc is valid. Must be called before adding any box.
+            unsafe { JxlEncoderUseBoxes(self.enc) };
+        }
 
         // SAFETY: frame_settings and pixel_format are valid; data pointer and
         // length cover the full pixel buffer for the frame.
@@ -131,6 +175,34 @@ impl JxlEncoder {
         };
         check(status)?;
 
+        // Add EXIF box if present. The contents must be prepended by a 4-byte
+        // TIFF header offset (all zeros when the header follows immediately).
+        if let Some(exif_data) = exif {
+            let mut box_contents = vec![0u8; 4];
+            box_contents.extend_from_slice(exif_data);
+            let box_type = JxlBoxType([
+                b'E' as std::ffi::c_char,
+                b'x' as std::ffi::c_char,
+                b'i' as std::ffi::c_char,
+                b'f' as std::ffi::c_char,
+            ]);
+            // SAFETY: enc is valid, box_type is a valid 4-byte type,
+            // contents pointer and length are valid for the slice lifetime.
+            let status = unsafe {
+                JxlEncoderAddBox(
+                    self.enc,
+                    &box_type,
+                    box_contents.as_ptr(),
+                    box_contents.len(),
+                    JxlBool::False,
+                )
+            };
+            check(status)?;
+
+            // SAFETY: enc is valid; signals that no more boxes will be added.
+            unsafe { JxlEncoderCloseBoxes(self.enc) };
+        }
+
         // SAFETY: enc is valid; signals that no more frames will be added.
         unsafe { JxlEncoderCloseInput(self.enc) };
 
@@ -138,8 +210,11 @@ impl JxlEncoder {
     }
 
     fn collect_output(&mut self) -> Result<Vec<u8>, String> {
-        let mut output = Vec::new();
-        let mut buf = vec![0u8; 4096];
+        // Heuristic: pre-size output to roughly the uncompressed size / 4
+        // (a typical conservative compression ratio). This avoids most
+        // reallocations without over-allocating too much for lossless.
+        let mut output = Vec::with_capacity(1024 * 1024); // 1 MiB initial
+        let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB chunk
         loop {
             let mut next_out = buf.as_mut_ptr();
             let mut avail_out = buf.len();
