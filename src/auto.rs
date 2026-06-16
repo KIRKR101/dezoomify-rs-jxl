@@ -10,25 +10,31 @@ pub fn prioritize_dezoomers_for_url(
     url: &str,
     mut dezoomers: Vec<Box<dyn Dezoomer>>,
 ) -> Vec<Box<dyn Dezoomer>> {
-    // Define URL patterns and their preferred dezoomers
+    // Define URL patterns and their preferred dezoomers (matched case-insensitively)
+    let lower_url = url.to_lowercase();
     let patterns = [
         ("info.json", "iiif"),
         ("iiif", "iiif"),
         ("manifest.json", "iiif"),
         (".dzi", "deepzoom"),
         ("_files/", "deepzoom"),
-        ("?FIF", "IIPImage"),
+        ("?fif", "IIPImage"),
         ("tiles.xml", "krpano"),
-        ("ImageProperties.xml", "zoomify"),
-        ("TileGroup", "zoomify"),
+        ("imageproperties.xml", "zoomify"),
+        ("tilegroup", "zoomify"),
         ("digitalcollections.nypl.org", "nypl"),
+        ("artsandculture.google.com", "google_arts_and_culture"),
+        ("tiles.yaml", "custom"),
+        ("tiles.yml", "custom"),
+        (".pff", "pff"),
+        ("requesttype=", "pff"),
         ("{{", "generic"),
     ];
 
     // Find the best matching dezoomer
     let preferred_dezoomer = patterns
         .iter()
-        .find(|(pattern, _)| url.contains(pattern))
+        .find(|(pattern, _)| lower_url.contains(pattern))
         .map(|(_, dezoomer)| *dezoomer);
 
     if let Some(preferred_name) = preferred_dezoomer {
@@ -259,6 +265,18 @@ mod tests {
         // DeepZoom dezoomer should be first
         assert_eq!(prioritized[0].name(), "deepzoom");
 
+        // Test IIPImage URL prioritization
+        let iip_url = "https://example.com/image.ptif?FIF=image.ptif";
+        let dezoomers = all_dezoomers(false);
+        let prioritized = prioritize_dezoomers_for_url(iip_url, dezoomers);
+        assert_eq!(prioritized[0].name(), "IIPImage");
+
+        // Test Google Arts & Culture URL prioritization
+        let ga_url = "https://artsandculture.google.com/asset/...";
+        let dezoomers = all_dezoomers(false);
+        let prioritized = prioritize_dezoomers_for_url(ga_url, dezoomers);
+        assert_eq!(prioritized[0].name(), "google_arts_and_culture");
+
         // Test unknown URL - should preserve original order
         let unknown_url = "https://example.com/unknown.xyz";
         let dezoomers = all_dezoomers(false);
@@ -287,9 +305,8 @@ mod tests {
         // Test case insensitive matching
         let zoomify_upper = "https://example.com/IMAGEPROPERTIES.XML";
         let dezoomers = all_dezoomers(false);
-        let original_first = dezoomers[0].name();
         let prioritized = prioritize_dezoomers_for_url(zoomify_upper, dezoomers);
-        // Current implementation is case-sensitive, so uppercase won't match
-        assert_eq!(prioritized[0].name(), original_first);
+        // Matching is now case-insensitive, so uppercase ImageProperties.xml matches zoomify.
+        assert_eq!(prioritized[0].name(), "zoomify");
     }
 }

@@ -2,9 +2,9 @@
 
 use std::env::current_dir;
 
+use std::io;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::io;
 
 use log::{debug, error, info};
 use reqwest::Client;
@@ -15,15 +15,15 @@ use dezoomer::TileReference;
 use dezoomer::{Dezoomer, DezoomerError, DezoomerInput};
 use dezoomer::{ZoomLevel, ZoomLevelIter};
 pub use errors::ZoomError;
-use network::{client, fetch_uri};
-use output_file::get_outname;
+use network::{client, fetch_metadata_uri};
+use output_file::reserve_unique_outname;
 use tile::Tile;
 pub use vec2d::Vec2d;
 
 use crate::dezoomer::{DezoomerResult, PageContents, ZoomableImage};
 use crate::encoder::tile_buffer::TileBuffer;
-
-use crate::output_file::reserve_output_file;
+use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 mod arguments;
 mod binary_display;
@@ -76,7 +76,7 @@ async fn get_dezoomer_result(
         match dezoomer.dezoomer_result(&i) {
             Ok(result) => return Ok(result),
             Err(DezoomerError::NeedsData { uri }) => {
-                let contents = fetch_uri(&uri, http).await.into();
+                let contents = fetch_metadata_uri(&uri, http).await.into();
                 debug!("Response for metadata file '{}': {:?}", uri, &contents);
                 i.uri = uri;
                 i.contents = contents;
@@ -257,9 +257,8 @@ fn prepare_output_path(
     base_dir: &Path,
     size_hint: Option<Vec2d>,
 ) -> Result<PathBuf, ZoomError> {
-    let outname = get_outname(outfile_arg, title, base_dir, size_hint);
+    let outname = reserve_unique_outname(outfile_arg, title, base_dir, size_hint)?;
     let save_as = std::path::absolute(outname.as_path()).unwrap_or_else(|_e| outname.clone());
-    reserve_output_file(&save_as)?;
     Ok(save_as)
 }
 
@@ -273,6 +272,16 @@ async fn create_tile_buffer(
 }
 
 pub async fn dezoomify(args: &Arguments) -> Result<PathBuf, ZoomError> {
+    dezoomify_with_cancel(args, CancellationToken::new()).await
+}
+
+/// Same as [`dezoomify`], but allows the caller to share a cancellation
+/// token with other concurrently-running dezoomify operations (e.g. from
+/// a custom binary that drives the library).
+pub async fn dezoomify_with_cancel(
+    args: &Arguments,
+    cancel: CancellationToken,
+) -> Result<PathBuf, ZoomError> {
     let zoom_level = find_zoomlevel(args).await?;
     let base_dir = current_dir()?;
     let output_file = args.output_file();
@@ -285,7 +294,7 @@ pub async fn dezoomify(args: &Arguments) -> Result<PathBuf, ZoomError> {
     let tile_buffer =
         create_tile_buffer(save_as.clone(), args.compression, args.jxl_effort).await?;
     info!("Dezooming {}", zoom_level.name());
-    dezoomify_level(args, zoom_level, tile_buffer).await?;
+    dezoomify_level(args, zoom_level, tile_buffer, cancel, None).await?;
     Ok(save_as)
 }
 
@@ -322,10 +331,24 @@ impl BulkStats {
 
 /// Process multiple images in bulk mode using the new unified architecture
 pub async fn process_bulk(args: &Arguments) -> Result<BulkStats, ZoomError> {
+    process_bulk_with_cancel(args, CancellationToken::new()).await
+}
+
+/// Same as [`process_bulk`], but allows the caller to share a cancellation
+/// token with other concurrently-running bulk operations (e.g. from a
+/// custom binary that drives the library).
+pub async fn process_bulk_with_cancel(
+    args: &Arguments,
+    cancel: CancellationToken,
+) -> Result<BulkStats, ZoomError> {
     use log::{debug, trace};
 
     debug!("Starting bulk processing mode");
     trace!("Bulk processing arguments: {:?}", args);
+
+    if cancel.is_cancelled() {
+        return Err(ZoomError::Cancelled);
+    }
 
     // Get the bulk file/URI from arguments
     let bulk_uri = args.bulk.as_ref().ok_or_else(|| ZoomError::NoBulkUrl {
@@ -356,7 +379,8 @@ pub async fn process_bulk(args: &Arguments) -> Result<BulkStats, ZoomError> {
             .collect::<Vec<_>>()
     );
 
-    process_bulk_zoomable_images(dezoomer_result, args, &http, &mut stats, &base_dir).await?;
+    process_bulk_zoomable_images(dezoomer_result, args, &http, &mut stats, &base_dir, cancel)
+        .await?;
 
     // Log final statistics
     info!("Bulk processing complete!");
@@ -370,118 +394,239 @@ pub async fn process_bulk(args: &Arguments) -> Result<BulkStats, ZoomError> {
     Ok(stats)
 }
 
-/// Process a list of ZoomableImage objects in bulk - resolve each one to zoom levels as needed
+#[derive(Debug)]
+enum SingleBulkResult {
+    Success,
+    Partial {
+        successful_tiles: u64,
+        total_tiles: u64,
+    },
+    Failure {
+        msg: String,
+    },
+}
+
+/// The result of processing a single image in a bulk run.
+#[derive(Debug)]
+struct SingleBulkOutcome {
+    index: usize,
+    title: String,
+    result: SingleBulkResult,
+    /// The path the image was saved to, if processing reached the point of
+    /// reserving an output file.
+    save_as: Option<PathBuf>,
+}
+
+/// Process a list of ZoomableImage objects in bulk - resolve each one to zoom levels as needed.
+/// When `--bulk-parallelism` is greater than 1, images are processed concurrently.
 async fn process_bulk_zoomable_images(
     images: Vec<ZoomableImage>,
     args: &Arguments,
     http: &Client,
     stats: &mut BulkStats,
     base_dir: &Path,
+    cancel: CancellationToken,
 ) -> Result<(), ZoomError> {
-    use log::{debug, trace, warn};
+    use log::warn;
     let bulk_outfile = args.bulk_output_file();
+    let total_images = stats.total_images;
+    let parallelism = args.bulk_parallelism.max(1);
 
-    // Process each ZoomableImage individually
-    for (index, zoomable_image) in images.into_iter().enumerate() {
-        let image_title = zoomable_image
-            .title()
-            .unwrap_or_else(|| format!("Image_{}", index + 1).into())
-            .to_string();
-        debug!(
-            "Preparing image {}/{}: {}",
-            index + 1,
-            stats.total_images,
-            image_title
-        );
+    // A single MultiProgress is shared across all bulk images so that per-image
+    // progress bars stack vertically instead of fighting each other on stderr.
+    let multi = std::sync::Arc::new(indicatif::MultiProgress::new());
 
-        // Resolve the ZoomableImage to get zoom levels
-        let zoom_levels = match zoomable_image.into_zoom_levels(http).await {
-            Ok(levels) => levels,
-            Err(e) => {
-                warn!(
-                    "Failed to get zoom levels for image {} ('{}'): {}",
-                    index + 1,
-                    image_title,
-                    e
-                );
-                stats.record_failure();
-                continue;
-            }
-        };
-
-        trace!(
-            "Zoom levels for image {}: {} levels available",
-            index + 1,
-            zoom_levels.len()
-        );
-
-        // Choose the appropriate zoom level using existing logic
-        let zoom_level = match choose_level(zoom_levels, args) {
-            Ok(level) => level,
-            Err(e) => {
-                warn!(
-                    "Failed to choose zoom level for image {} ('{}'): {}",
-                    index + 1,
-                    image_title,
-                    e
-                );
-                stats.record_failure();
-                continue;
-            }
-        };
-
-        debug!(
-            "Selected zoom level for image {}: {} ({}x{})",
-            index + 1,
-            zoom_level.name(),
-            zoom_level.size_hint().map(|s| s.x).unwrap_or(0),
-            zoom_level.size_hint().map(|s| s.y).unwrap_or(0)
-        );
-
-        // Use get_outname to handle file collision properly, without args.outfile override
-        let save_as = if let Some(ref base_outfile) = bulk_outfile {
-            // In bulk mode with specified outfile, use index-based naming with collision handling
-            let base_path = generate_bulk_output_name(base_outfile, index);
-            get_outname(
-                &Some(base_path),
-                &zoom_level.title().or_else(|| Some(image_title.clone())),
-                base_dir,
-                zoom_level.size_hint(),
-            )
-        } else {
-            // Use the zoom level title if present, fallback to image title
-            get_outname(
-                &None,
-                &zoom_level.title().or_else(|| Some(image_title.clone())),
-                base_dir,
-                zoom_level.size_hint(),
-            )
-        };
-
-        // Reserve the output file to avoid collisions
-        if let Err(e) = reserve_output_file(&save_as) {
-            let file_name = save_as
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_else(|| "unknown".into());
-            warn!(
-                "Failed to prepare output file '{}' for image {} ('{}'): {}",
-                file_name,
-                index + 1,
-                image_title,
-                e
-            );
-            stats.record_failure();
-            continue;
-        };
-
-        let tile_buffer = match create_tile_buffer(
-            save_as.clone(),
-            args.compression,
-            args.jxl_effort,
+    let futures = images.into_iter().enumerate().map(|(index, image)| {
+        let multi = std::sync::Arc::clone(&multi);
+        process_single_bulk_image(
+            args,
+            http,
+            base_dir,
+            bulk_outfile.as_ref(),
+            index,
+            total_images,
+            image,
+            cancel.clone(),
+            multi,
         )
-        .await
-        {
+    });
+    let mut stream = futures::stream::iter(futures).buffer_unordered(parallelism);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                warn!("Cancellation requested; abandoning in-flight bulk image tasks.");
+                // Dropping the stream cancels the futures that buffer_unordered
+                // is polling, which stops network downloads promptly. Background
+                // encoder tasks exit once their channels close.
+                return Err(ZoomError::Cancelled);
+            }
+            result = stream.next() => {
+                match result {
+                    None => break,
+                    Some(outcome) => {
+                        // Suspend the bar drawing while we emit log lines, so the [INFO]/[WARN]
+                        // messages land on a clean row above the bars instead of being overwritten.
+                        multi.suspend(|| match outcome {
+                            Ok(SingleBulkOutcome {
+                                index,
+                                result: SingleBulkResult::Success,
+                                save_as,
+                                ..
+                            }) => {
+                                if let Some(save_as) = save_as {
+                                    info!(
+                                        "Successfully saved image {} to {}",
+                                        index + 1,
+                                        save_as.display()
+                                    );
+                                } else {
+                                    info!("Successfully saved image {}", index + 1);
+                                }
+                                stats.record_success();
+                            }
+                            Ok(SingleBulkOutcome {
+                                index,
+                                result: SingleBulkResult::Partial {
+                                    successful_tiles,
+                                    total_tiles,
+                                },
+                                ..
+                            }) => {
+                                warn!(
+                                    "Image {} completed with partial download: {}/{} tiles",
+                                    index + 1,
+                                    successful_tiles,
+                                    total_tiles
+                                );
+                                stats.record_partial();
+                            }
+                            Ok(SingleBulkOutcome {
+                                index,
+                                title,
+                                result: SingleBulkResult::Failure { msg },
+                                ..
+                            }) => {
+                                warn!(
+                                    "Failed to process image {} ('{}'): {}",
+                                    index + 1,
+                                    title,
+                                    msg
+                                );
+                                stats.record_failure();
+                            }
+                            Err(e) => {
+                                warn!("Bulk task failed: {e}");
+                                stats.record_failure();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_single_bulk_image(
+    args: &Arguments,
+    http: &Client,
+    base_dir: &Path,
+    bulk_outfile: Option<&PathBuf>,
+    index: usize,
+    total_images: usize,
+    zoomable_image: ZoomableImage,
+    cancel: CancellationToken,
+    multi: std::sync::Arc<indicatif::MultiProgress>,
+) -> Result<SingleBulkOutcome, ZoomError> {
+    use log::{debug, trace, warn};
+    let image_title = zoomable_image
+        .title()
+        .unwrap_or_else(|| format!("Image_{}", index + 1).into())
+        .to_string();
+    debug!(
+        "Preparing image {}/{}: {}",
+        index + 1,
+        total_images,
+        image_title
+    );
+
+    // Resolve the ZoomableImage to get zoom levels
+    let zoom_levels = match zoomable_image.into_zoom_levels(http).await {
+        Ok(levels) => levels,
+        Err(e) => {
+            return Ok(SingleBulkOutcome {
+                index,
+                title: image_title,
+                result: SingleBulkResult::Failure { msg: e.to_string() },
+                save_as: None,
+            });
+        }
+    };
+
+    trace!(
+        "Zoom levels for image {}: {} levels available",
+        index + 1,
+        zoom_levels.len()
+    );
+
+    // Choose the appropriate zoom level using existing logic
+    let zoom_level = match choose_level(zoom_levels, args) {
+        Ok(level) => level,
+        Err(e) => {
+            return Ok(SingleBulkOutcome {
+                index,
+                title: image_title,
+                result: SingleBulkResult::Failure { msg: e.to_string() },
+                save_as: None,
+            });
+        }
+    };
+
+    debug!(
+        "Selected zoom level for image {}: {} ({}x{})",
+        index + 1,
+        zoom_level.name(),
+        zoom_level.size_hint().map(|s| s.x).unwrap_or(0),
+        zoom_level.size_hint().map(|s| s.y).unwrap_or(0)
+    );
+
+    // Compute and atomically reserve the output path. For derived titles this
+    // loops on _0001-style suffixes until it successfully creates the file.
+    let save_as = match if let Some(base_outfile) = bulk_outfile {
+        // In bulk mode with specified outfile, use index-based naming with collision handling
+        let base_path = generate_bulk_output_name(base_outfile, index);
+        reserve_unique_outname(
+            &Some(base_path),
+            &zoom_level.title().or_else(|| Some(image_title.clone())),
+            base_dir,
+            zoom_level.size_hint(),
+        )
+    } else {
+        // Use the zoom level title if present, fallback to image title
+        reserve_unique_outname(
+            &None,
+            &zoom_level.title().or_else(|| Some(image_title.clone())),
+            base_dir,
+            zoom_level.size_hint(),
+        )
+    } {
+        Ok(path) => path,
+        Err(e) => {
+            return Ok(SingleBulkOutcome {
+                index,
+                title: image_title,
+                result: SingleBulkResult::Failure { msg: e.to_string() },
+                save_as: None,
+            });
+        }
+    };
+
+    let tile_buffer =
+        match create_tile_buffer(save_as.clone(), args.compression, args.jxl_effort).await {
             Ok(buffer) => buffer,
             Err(e) => {
                 let file_name = save_as
@@ -495,55 +640,46 @@ async fn process_bulk_zoomable_images(
                     image_title,
                     e
                 );
-                stats.record_failure();
-                continue;
+                return Ok(SingleBulkOutcome {
+                    index,
+                    title: image_title,
+                    result: SingleBulkResult::Failure { msg: e.to_string() },
+                    save_as: Some(save_as),
+                });
             }
         };
 
-        // Now show processing message since we're about to start downloading
+    // Now show processing message since we're about to start downloading.
+    // Suspend the bar drawing first so this log line lands on a clean row
+    // above any per-image bars that the MultiProgress may already be showing.
+    multi.suspend(|| {
         info!(
             "Processing image {}/{}: {} -> {}",
             index + 1,
-            stats.total_images,
+            total_images,
             image_title,
             save_as.file_name().unwrap_or_default().to_string_lossy()
         );
+    });
 
-        match dezoomify_level(args, zoom_level, tile_buffer).await {
-            Ok(()) => {
-                info!(
-                    "Successfully saved image {} to {}",
-                    index + 1,
-                    save_as.display()
-                );
-                stats.record_success();
-            }
-            Err(ZoomError::PartialDownload {
-                successful_tiles,
-                total_tiles,
-                ..
-            }) => {
-                warn!(
-                    "Image {} completed with partial download: {}/{} tiles",
-                    index + 1,
-                    successful_tiles,
-                    total_tiles
-                );
-                stats.record_partial();
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to process image {} ('{}'): {}",
-                    index + 1,
-                    image_title,
-                    e
-                );
-                stats.record_failure();
-            }
-        }
-    }
-
-    Ok(())
+    let result = match dezoomify_level(args, zoom_level, tile_buffer, cancel, Some(&multi)).await {
+        Ok(()) => SingleBulkResult::Success,
+        Err(ZoomError::PartialDownload {
+            successful_tiles,
+            total_tiles,
+            ..
+        }) => SingleBulkResult::Partial {
+            successful_tiles,
+            total_tiles,
+        },
+        Err(e) => SingleBulkResult::Failure { msg: e.to_string() },
+    };
+    Ok(SingleBulkOutcome {
+        index,
+        title: image_title,
+        result,
+        save_as: Some(save_as),
+    })
 }
 
 /// Generate a unique output filename for bulk processing
@@ -564,7 +700,7 @@ fn generate_bulk_output_name(base_outfile: &Path, index: usize) -> PathBuf {
             result.set_file_name(new_name);
         }
     } else {
-        result.set_file_name(format!("dezoomified_{}.jpg", index + 1));
+        result.set_file_name(format!("dezoomified_{}.jxl", index + 1));
     }
 
     result
@@ -584,8 +720,9 @@ fn validate_download_success(state: &download_state::DownloadState) -> Result<()
 fn determine_final_result(
     state: &download_state::DownloadState,
     destination: String,
+    expects_failed_tiles: bool,
 ) -> Result<(), ZoomError> {
-    if state.has_partial_failure() {
+    if !expects_failed_tiles && state.has_partial_failure() {
         Err(ZoomError::PartialDownload {
             successful_tiles: state.successful_tiles,
             total_tiles: state.total_tiles,
@@ -600,18 +737,27 @@ pub async fn dezoomify_level(
     args: &Arguments,
     mut zoom_level: ZoomLevel,
     tile_buffer: TileBuffer,
+    cancel: CancellationToken,
+    multi: Option<&indicatif::MultiProgress>,
 ) -> Result<(), ZoomError> {
     debug!("Starting to dezoomify {zoom_level:?}");
     let mut canvas = tile_buffer;
-    let mut coordinator = download_state::TileDownloadCoordinator::new(&zoom_level, args)?;
+    let coordinator =
+        download_state::TileDownloadCoordinator::new(&zoom_level, args, cancel.clone())?;
     let mut state = download_state::DownloadState::new();
-    let progress = download_state::ProgressManager::new();
+    let progress = match multi {
+        Some(mp) => download_state::ProgressManager::new_in_multi(mp),
+        None => download_state::ProgressManager::new(),
+    };
 
     progress.set_computing_urls();
 
     let mut zoom_level_iter = ZoomLevelIter::new(&mut zoom_level);
 
-    while let Some(tile_refs) = zoom_level_iter.next_tile_references() {
+    while let Some(tile_refs) = zoom_level_iter.next_tile_references()? {
+        if cancel.is_cancelled() {
+            return Err(ZoomError::Cancelled);
+        }
         coordinator
             .download_batch(
                 tile_refs,
@@ -632,7 +778,7 @@ pub async fn dezoomify_level(
     progress.finish();
 
     let destination = canvas.destination().to_string_lossy().to_string();
-    determine_final_result(&state, destination)
+    determine_final_result(&state, destination, zoom_level.expects_failed_tiles())
 }
 
 /// Returns the maximal size a tile can have in order to fit in a canvas of the given size
@@ -746,7 +892,7 @@ mod tests {
         for _ in 0..10 {
             success_state.record_success();
         }
-        assert!(determine_final_result(&success_state, destination.clone()).is_ok());
+        assert!(determine_final_result(&success_state, destination.clone(), false).is_ok());
 
         // Partial failure
         let mut partial_state = download_state::DownloadState::new();
@@ -754,7 +900,7 @@ mod tests {
         for _ in 0..8 {
             partial_state.record_success();
         }
-        let result = determine_final_result(&partial_state, destination.clone());
+        let result = determine_final_result(&partial_state, destination.clone(), false);
         assert!(result.is_err());
         if let Err(ZoomError::PartialDownload {
             successful_tiles,
@@ -767,6 +913,25 @@ mod tests {
         } else {
             panic!("Expected PartialDownload error");
         }
+    }
+
+    #[test]
+    fn test_determine_final_result_ignores_failures_when_expected() {
+        // The generic dezoomer probes tiles past the image boundary and relies
+        // on 404s to discover the real dimensions. When the provider signals
+        // this with `expects_failed_tiles: true`, a partial download state must
+        // be reported as success.
+        let destination = "test.jxl".to_string();
+
+        let mut partial_state = download_state::DownloadState::new();
+        partial_state.add_batch(10);
+        for _ in 0..4 {
+            partial_state.record_success();
+        }
+        assert!(
+            determine_final_result(&partial_state, destination, true).is_ok(),
+            "expects_failed_tiles=true should suppress PartialDownload"
+        );
     }
 
     #[test]
@@ -898,18 +1063,24 @@ mod tests {
     }
 
     #[test]
-    fn test_bulk_mode_outfile_option_overrides_positionals() {
-        let args = Arguments::parse_from([
+    fn test_bulk_mode_outfile_option_conflicts_with_positional() {
+        // When the user provides both the positional OUTFILE and the --outfile
+        // flag, clap must reject the invocation rather than silently picking
+        // one. This guards against the previous behavior where the flag would
+        // override the positional without warning.
+        let result = Arguments::try_parse_from([
             "dezoomify-rs",
             "--bulk",
             "urls.txt",
-            "positional-input.jpg",
+            "input.jpg",          // input_uri
+            "positional-out.jpg", // outfile (positional)
             "--outfile",
-            "from-option.jpg",
+            "from-flag.jpg",
         ]);
-        assert_eq!(
-            args.bulk_output_file(),
-            Some(PathBuf::from("from-option.jpg"))
+        assert!(
+            result.is_err(),
+            "expected clap to reject conflicting positional and --outfile, got: {:?}",
+            result.map(|a| a.bulk_output_file())
         );
     }
 }

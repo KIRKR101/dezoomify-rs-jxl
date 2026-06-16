@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::io::Write;
 
 use jpegxl_sys::common::types::{JxlBool, JxlBoxType, JxlDataType, JxlEndianness, JxlPixelFormat};
 use jpegxl_sys::encoder::encode::*;
@@ -91,14 +92,15 @@ impl JxlEncoder {
         check(status)
     }
 
-    pub fn encode_frame(
+    pub fn encode_frame<W: Write>(
         &mut self,
+        writer: &mut W,
         data: &[u8],
         has_alpha: bool,
         quality: f32,
         effort: u8,
         exif: Option<&[u8]>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(), String> {
         // SAFETY: quality is a float, the C function has no safety requirements.
         let distance = unsafe { JxlEncoderDistanceFromQuality(quality) };
 
@@ -206,14 +208,10 @@ impl JxlEncoder {
         // SAFETY: enc is valid; signals that no more frames will be added.
         unsafe { JxlEncoderCloseInput(self.enc) };
 
-        self.collect_output()
+        self.write_output(writer)
     }
 
-    fn collect_output(&mut self) -> Result<Vec<u8>, String> {
-        // Heuristic: pre-size output to roughly the uncompressed size / 4
-        // (a typical conservative compression ratio). This avoids most
-        // reallocations without over-allocating too much for lossless.
-        let mut output = Vec::with_capacity(1024 * 1024); // 1 MiB initial
+    fn write_output<W: Write>(&mut self, writer: &mut W) -> Result<(), String> {
         let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB chunk
         loop {
             let mut next_out = buf.as_mut_ptr();
@@ -225,7 +223,9 @@ impl JxlEncoder {
                 unsafe { JxlEncoderProcessOutput(self.enc, &mut next_out, &mut avail_out) };
 
             let written = buf.len() - avail_out;
-            output.extend_from_slice(&buf[..written]);
+            writer
+                .write_all(&buf[..written])
+                .map_err(|e| format!("failed to write JXL output: {e}"))?;
 
             match status {
                 JxlEncoderStatus::Success => break,
@@ -233,7 +233,7 @@ impl JxlEncoder {
                 _ => return Err("JxlEncoderProcessOutput error".into()),
             }
         }
-        Ok(output)
+        Ok(())
     }
 }
 

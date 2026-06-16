@@ -1,3 +1,4 @@
+use log::debug;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -287,6 +288,23 @@ impl Manifest {
                 // if annotation_page.annotation_page_type != "AnnotationPage" { continue; }
 
                 for annotation in &annotation_page.items {
+                    // IIIF Presentation API 3 restricts image annotations to those
+                    // with motivation "painting". We also accept missing motivation
+                    // for simple/older manifests. Other motivations (e.g.
+                    // "supplementing") are intentionally ignored, which means a
+                    // manifest that previously produced extra images may now
+                    // produce fewer.
+                    let is_painting = annotation
+                        .motivation
+                        .as_deref()
+                        .is_none_or(|m| m == "painting");
+                    if !is_painting {
+                        debug!(
+                            "Skipping annotation with non-painting motivation: {:?}",
+                            annotation.motivation
+                        );
+                        continue;
+                    }
                     if let AnnotationBody::Image(image_body) = &annotation.body {
                         // Expect "Image" type for the body, but rely on service presence.
                         // if image_body.image_type != "Image" { continue; }
@@ -720,6 +738,31 @@ mod tests {
         assert_eq!(infos[0].manifest_label, Some("Book 1".to_string()));
         assert_eq!(infos[0].canvas_label, Some("p. 1".to_string()));
         assert_eq!(infos[0].canvas_index, 0);
+    }
+
+    #[test]
+    fn test_non_painting_annotations_are_skipped() {
+        let json_data = r#"
+        {
+          "id": "manifest-motivation", "type": "Manifest",
+          "items": [{ "id": "c1", "type": "Canvas", "items": [{ "id": "ap1", "type": "AnnotationPage", "items": [
+            { "id": "a1", "type": "Annotation", "motivation": "painting",
+              "body": { "id": "img1.jpg", "type": "Image" }},
+            { "id": "a2", "type": "Annotation", "motivation": "supplementing",
+              "body": { "id": "img2.jpg", "type": "Image" }},
+            { "id": "a3", "type": "Annotation", "motivation": "commenting",
+              "body": { "id": "img3.jpg", "type": "Image" }}
+          ]}]}]
+        }
+        "#;
+        let manifest: Manifest = serde_json::from_str(json_data).unwrap();
+        let infos = manifest.extract_image_infos("https://example.org/");
+        assert_eq!(
+            infos.len(),
+            1,
+            "only painting annotations should be extracted"
+        );
+        assert_eq!(infos[0].image_uri, "https://example.org/img1.jpg");
     }
 
     #[test]

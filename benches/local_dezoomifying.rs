@@ -3,10 +3,14 @@ use std::time::Duration;
 use tokio::runtime;
 
 #[path = "../tests/local_dezoomifying.rs"]
+#[allow(dead_code)]
 mod tests;
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let rt = runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap();
 
     c.bench_function("zoomify_1702x2052_jpeg", |b| {
         b.iter(|| {

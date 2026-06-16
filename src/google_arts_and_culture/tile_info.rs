@@ -5,7 +5,7 @@ use std::str::FromStr;
 use regex::Regex;
 use serde::Deserialize;
 
-use custom_error::custom_error;
+use thiserror::Error;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct TileInfo {
@@ -161,11 +161,17 @@ impl FromStr for PageInfo {
     }
 }
 
-custom_error! {pub PageParseError
-    NoPath                      = "Unable to find path information",
-    BadPath                     = "The path has an invalid form",
-    NoToken                     = "Unable to find the token in the page",
-    InvalidToken{token: String} = "Invalid token: '{token}'",
+#[derive(Error, Debug)]
+#[allow(dead_code)]
+pub enum PageParseError {
+    #[error("Unable to find path information")]
+    NoPath,
+    #[error("The path has an invalid form")]
+    BadPath,
+    #[error("Unable to find the token in the page")]
+    NoToken,
+    #[error("Invalid token: '{token}'")]
+    InvalidToken { token: String },
 }
 
 #[cfg(test)]

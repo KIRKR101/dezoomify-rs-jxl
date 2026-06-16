@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::io::{self, Write};
 
 use image::{DynamicImage, GenericImageView, Pixel, Rgb, SubImage};
@@ -11,6 +10,7 @@ use crate::{Vec2d, max_size_in_rect};
 use std::sync::Arc;
 
 const BYTES_PER_PIXEL: usize = Rgb::<u8>::CHANNEL_COUNT as usize;
+static ZERO_BUF: [u8; 65536] = [0; 65536];
 
 /// A structure to which you write tiles, not necessarily in order,
 /// and that itself writes RGB pixels to its writer, ordered from top left to bottom right
@@ -33,8 +33,11 @@ impl<W: Write> PixelStreamer<W> {
 
     pub fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
         for strip in ImageStrip::in_tile(tile, self.size) {
-            let key = strip.pixel_index(self.size);
-            self.strips.insert(key, strip);
+            if let Some(key) = strip.pixel_index(self.size) {
+                self.strips.insert(key, strip);
+            }
+            // If the strip's index doesn't fit in memory, we silently drop it.
+            // Images that large are not practically encodable anyway.
         }
         self.advance(false)
     }
@@ -75,10 +78,16 @@ impl<W: Write> PixelStreamer<W> {
     /// Write blank pixels until the given pixel index
     pub fn fill_blank(&mut self, until: usize) -> io::Result<()> {
         if until > self.current_index {
-            let remaining = until - self.current_index;
-            debug!("Filling incomplete image with {remaining} pixels");
-            let blank = vec![0; remaining * BYTES_PER_PIXEL];
-            self.writer.write_all(&blank)?;
+            let mut remaining = (until - self.current_index) * BYTES_PER_PIXEL;
+            debug!(
+                "Filling incomplete image with {} blank pixels",
+                remaining / BYTES_PER_PIXEL
+            );
+            while remaining > 0 {
+                let chunk = remaining.min(ZERO_BUF.len());
+                self.writer.write_all(&ZERO_BUF[..chunk])?;
+                remaining -= chunk;
+            }
             self.current_index = until;
         }
         Ok(())
@@ -100,9 +109,11 @@ impl ImageStrip {
             .zip(0..height)
             .map(|(source, line)| ImageStrip { source, line })
     }
-    pub fn pixel_index(&self, image_size: Vec2d) -> usize {
+    pub fn pixel_index(&self, image_size: Vec2d) -> Option<usize> {
         let position = self.source.position + Vec2d { x: 0, y: self.line };
-        (position.y as usize) * (image_size.x as usize) + (position.x as usize)
+        (position.y as usize)
+            .checked_mul(image_size.x as usize)
+            .and_then(|base| base.checked_add(position.x as usize))
     }
     pub fn cropped(&self, image_size: Vec2d) -> SubImage<&DynamicImage> {
         crop_tile(&self.source, image_size)
@@ -118,7 +129,8 @@ impl ImageStrip {
         writer: &mut W,
     ) -> io::Result<()> {
         let img = self.cropped(image_size);
-        let x0 = u32::try_from(start_at).unwrap();
+        // start_at is an offset within this strip, so it cannot exceed the strip width.
+        let x0 = start_at.min(img.width() as usize) as u32;
         let pixel_count = (img.width() - x0) as usize;
         let mut line_buf = Vec::with_capacity(pixel_count * BYTES_PER_PIXEL);
         for x in x0..img.width() {

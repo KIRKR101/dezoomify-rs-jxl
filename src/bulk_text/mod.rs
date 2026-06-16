@@ -1,13 +1,15 @@
 use crate::dezoomer::*;
-use custom_error::custom_error;
+use thiserror::Error;
 
-custom_error! {pub BulkTextError
-    InvalidUrlOrPath{line_number: usize, input: String} = "On line {line_number}: '{input}' is not a valid URL or file path"
+#[derive(Error, Debug)]
+pub enum BulkTextError {
+    #[error("On line {line_number}: '{input}' is not a valid URL or file path")]
+    InvalidUrlOrPath { line_number: usize, input: String },
 }
 
 impl From<BulkTextError> for DezoomerError {
     fn from(err: BulkTextError) -> Self {
-        DezoomerError::Other { source: err.into() }
+        DezoomerError::wrap(err)
     }
 }
 
@@ -51,9 +53,9 @@ impl Dezoomer for BulkTextDezoomer {
         let urls = parse_text_urls(content)?;
 
         if urls.is_empty() {
-            return Err(DezoomerError::Other {
-                source: Box::new(std::io::Error::other("No valid URLs found in text file")),
-            });
+            return Err(DezoomerError::wrap(std::io::Error::other(
+                "No valid URLs found in text file",
+            )));
         }
 
         Ok(dezoomer_result_from_urls(urls))
@@ -84,34 +86,34 @@ fn validate_url_or_path(input: &str, line_number: usize) -> Result<(), BulkTextE
 }
 
 /// Parse a text file content and extract URLs
-/// Each non-empty, non-comment line should start with a valid URL
-/// Optional custom title can be provided after the URL, separated by whitespace
-/// Format: URL [custom title]
+/// Each non-empty, non-comment line should start with a valid URL.
+/// An optional custom title can follow the URL. Titles may be quoted with " or '.
+/// Inline comments are supported after the title using ` # `.
+/// Formats:
+///   URL
+///   URL My title
+///   URL "My title"
+///   URL 'My title' # inline comment
 fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError> {
     let mut urls = Vec::new();
 
     for (line_num, line) in content.lines().enumerate() {
         let trimmed = line.trim();
 
-        // Skip empty lines and comments
+        // Skip empty lines and full-line comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Split line into URL and optional title
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let url_part = parts.next().unwrap_or_default();
-        let custom_title = parts.next().filter(|s| !s.is_empty());
+        let (url_part, custom_title) = split_url_and_title(trimmed);
 
         // Validate that the first part is a valid URL or file path
         validate_url_or_path(url_part, line_num + 1)?;
 
         // Use custom title if provided, otherwise extract from URL
-        let title = if let Some(custom_title) = custom_title {
-            Some(custom_title.to_string())
-        } else {
-            extract_title_from_url(url_part, line_num + 1)
-        };
+        let title = custom_title
+            .map(|t| t.to_string())
+            .or_else(|| extract_title_from_url(url_part, line_num + 1));
 
         urls.push(ZoomableImageUrl {
             url: url_part.to_string(),
@@ -120,6 +122,50 @@ fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError
     }
 
     Ok(urls)
+}
+
+/// Split a bulk-text line into a URL and an optional title.
+/// Supports quoted titles and ` # ` inline comments.
+fn split_url_and_title(line: &str) -> (&str, Option<&str>) {
+    // Extract the URL as the first whitespace-delimited token.
+    let mut chars = line.char_indices();
+    let (url_end, rest) = loop {
+        match chars.next() {
+            Some((idx, c)) if c.is_whitespace() => break (idx, &line[idx..]),
+            None => return (line, None),
+            _ => continue,
+        }
+    };
+    let url = &line[..url_end];
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return (url, None);
+    }
+
+    // Strip inline comments (` # `) unless they are inside a quoted title.
+    let title = if let Some(first) = rest.chars().next() {
+        if first == '"' || first == '\'' {
+            if let Some(close) = rest[1..].find(first) {
+                &rest[1..=close]
+            } else {
+                // Unterminated quote: treat everything after the quote as title.
+                &rest[1..]
+            }
+        } else if let Some(comment_pos) = rest.find(" #") {
+            rest[..comment_pos].trim_end()
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+
+    let title = title.trim();
+    if title.is_empty() {
+        (url, None)
+    } else {
+        (url, Some(title))
+    }
 }
 
 /// Extract a title from a URL for better identification
@@ -292,5 +338,58 @@ mod tests {
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("line 1"));
         assert!(error_msg.contains("not_a_valid_url"));
+    }
+
+    #[test]
+    fn test_parse_quoted_titles_and_inline_comments() {
+        let content = r#"
+http://example.com/1.jpg "My Cool Title" # ignored comment
+http://example.com/2.jpg 'Another Title'
+http://example.com/3.jpg Plain title # comment
+"#;
+        let urls = parse_text_urls(content).unwrap();
+        assert_eq!(urls.len(), 3);
+        assert_eq!(urls[0].title, Some("My Cool Title".to_string()));
+        assert_eq!(urls[1].title, Some("Another Title".to_string()));
+        assert_eq!(urls[2].title, Some("Plain title".to_string()));
+    }
+
+    #[test]
+    fn test_split_url_and_title_simple() {
+        let (url, title) = split_url_and_title("http://x.jpg A title");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, Some("A title"));
+    }
+
+    #[test]
+    fn test_split_url_and_title_quoted() {
+        let (url, title) = split_url_and_title("http://x.jpg \"Quoted Title\" # comment");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, Some("Quoted Title"));
+    }
+
+    #[test]
+    fn test_split_url_and_title_no_title() {
+        let (url, title) = split_url_and_title("http://x.jpg");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn test_split_url_and_title_comment_requires_space() {
+        // The inline-comment syntax is ` # ` (space, hash, space). A hash
+        // attached directly to the title is treated as part of the title.
+        let (url, title) = split_url_and_title("http://x.jpg My title#comment");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, Some("My title#comment"));
+    }
+
+    #[test]
+    fn test_split_url_and_title_trims_quoted_whitespace() {
+        // Quoted titles are extracted without the surrounding quotes, then
+        // trimmed like unquoted titles.
+        let (url, title) = split_url_and_title("http://x.jpg \"  Padded  \"");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, Some("Padded"));
     }
 }

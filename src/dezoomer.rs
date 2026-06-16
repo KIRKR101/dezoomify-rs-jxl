@@ -17,9 +17,10 @@ pub enum PageContents {
     Error(ZoomError),
 }
 
-impl From<Result<Vec<u8>, ZoomError>> for PageContents {
-    fn from(res: Result<Vec<u8>, ZoomError>) -> Self {
-        res.map(Self::Success).unwrap_or_else(Self::Error)
+impl From<Result<bytes::Bytes, ZoomError>> for PageContents {
+    fn from(res: Result<bytes::Bytes, ZoomError>) -> Self {
+        res.map(|b| Self::Success(b.to_vec()))
+            .unwrap_or_else(Self::Error)
     }
 }
 
@@ -111,7 +112,7 @@ impl ZoomableImage {
             ZoomableImage::ImageUrl(url) => {
                 // Import at the top of the function rather than globally
                 use crate::auto::{all_dezoomers, prioritize_dezoomers_for_url};
-                use crate::network::fetch_uri;
+                use crate::network::fetch_metadata_uri;
                 use log::debug;
 
                 let ZoomableImageUrl { url, title } = url;
@@ -148,7 +149,7 @@ impl ZoomableImage {
                                     dezoomer.name(),
                                     needed_uri
                                 );
-                                let contents = fetch_uri(&needed_uri, http).await.into();
+                                let contents = fetch_metadata_uri(&needed_uri, http).await.into();
                                 input.uri = needed_uri;
                                 input.contents = contents;
                             }
@@ -175,7 +176,10 @@ struct TitledZoomLevel {
 }
 
 impl TileProvider for TitledZoomLevel {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
         self.inner.next_tiles(previous)
     }
 
@@ -310,7 +314,7 @@ impl TileFetchResult {
     }
 }
 
-type PostProcessResult = Result<Vec<u8>, Box<dyn Error + Send>>;
+type PostProcessResult = Result<Vec<u8>, Box<dyn Error + Send + Sync>>;
 // TODO : fix
 // see: https://github.com/rust-lang/rust/issues/63033
 #[derive(Clone, Copy)]
@@ -323,7 +327,19 @@ pub enum PostProcessFn {
 pub trait TileProvider: Debug {
     /// Provide a list of image tiles. Should be called repetitively until it returns
     /// an empty list. Each new call takes the results of the previous tile fetch as a parameter.
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference>;
+    ///
+    /// An `Err` is propagated to the caller rather than silently dropped so that
+    /// tile-URL generation failures (e.g. a PFF server reporting fewer tile
+    /// indices than requested) surface to the user instead of producing a
+    /// silently incomplete image.
+    ///
+    /// **Breaking change (added in 2.16.0):** the return type changed from
+    /// `Vec<TileReference>` to `Result<Vec<TileReference>, ZoomError>`. Existing
+    /// implementers must wrap their previous return value in `Ok(...)`.
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError>;
 
     /// A function that takes the downloaded tile bytes and decodes them
     fn post_process_fn(&self) -> PostProcessFn {
@@ -358,6 +374,24 @@ pub trait TileProvider: Debug {
     /// A collection of http headers to use when requesting the tiles
     fn http_headers(&self) -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Whether this provider intentionally requests tiles that may not exist.
+    ///
+    /// Some dezoomers (notably the generic template dezoomer) probe tiles past
+    /// the image's actual extent in order to discover its real dimensions,
+    /// deliberately tolerating HTTP 404s. When this method returns `true`,
+    /// the download coordinator will not treat 404s as a partial-download
+    /// failure.
+    ///
+    /// **Breaking change (added in 2.16.0):** this method's default is
+    /// `false`, so third-party `TileProvider` implementers that probe past
+    /// the image boundary **must** override this and return `true`. Otherwise
+    /// 404s will be reported as a partial download even though the dezoomer
+    /// expected them. The default of `false` is the safe choice for any
+    /// dezoomer that expects every requested tile to actually exist.
+    fn expects_failed_tiles(&self) -> bool {
+        false
     }
 }
 
@@ -407,11 +441,15 @@ impl<'a> ZoomLevelIter<'a> {
             waiting_results: false,
         }
     }
-    pub fn next_tile_references(&mut self) -> Option<Vec<TileReference>> {
+    pub fn next_tile_references(&mut self) -> Result<Option<Vec<TileReference>>, ZoomError> {
         assert!(!self.waiting_results);
         self.waiting_results = true;
-        let tiles = self.zoom_level.next_tiles(self.previous);
-        if tiles.is_empty() { None } else { Some(tiles) }
+        let tiles = self.zoom_level.next_tiles(self.previous)?;
+        if tiles.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(tiles))
+        }
     }
     pub fn set_fetch_result(&mut self, result: TileFetchResult) {
         assert!(self.waiting_results);
@@ -433,15 +471,15 @@ pub fn single_level<T: TileProvider + Send + Sync + 'static>(
 pub trait TilesRect: Debug {
     fn size(&self) -> Vec2d;
     fn tile_size(&self) -> Vec2d;
-    fn tile_url(&self, pos: Vec2d) -> String;
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError>;
     fn title(&self) -> Option<String> {
         None
     }
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
-        TileReference {
-            url: self.tile_url(pos),
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos,
-        }
+        })
     }
     fn post_process_fn(&self) -> PostProcessFn {
         PostProcessFn::None
@@ -454,11 +492,14 @@ pub trait TilesRect: Debug {
 }
 
 impl<T: TilesRect> TileProvider for T {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
         // When the dimensions are known in advance, we can always generate
         // a single batch of tile references. So any subsequent call returns an empty vector.
         if previous.is_some() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let tile_size = self.tile_size();
@@ -466,6 +507,10 @@ impl<T: TilesRect> TileProvider for T {
         let this: &T = self.borrow(); // Immutable borrow
         (0..h)
             .flat_map(move |y| (0..w).map(move |x| this.tile_ref(Vec2d { x, y })))
+            // Tile URL generation can in principle fail (e.g. PFF tile indices
+            // are looked up against a server-reported list and may be out of
+            // range). Surface the error to the caller rather than silently
+            // producing a malformed URL.
             .collect()
     }
 
@@ -496,8 +541,12 @@ impl<T: TilesRect> TileProvider for T {
 
     fn http_headers(&self) -> HashMap<String, String> {
         let mut headers = HashMap::new();
-        // By default, use the first tile as the referer, so that it is on the same domain
-        headers.insert("Referer".into(), self.tile_url(Vec2d::default()));
+        // By default, use the first tile as the referer, so that it is on the same domain.
+        // If the URL cannot be generated, fall back to an empty Referer rather than
+        // fabricating a non-URL string.
+        if let Ok(url) = self.tile_url(Vec2d::default()) {
+            headers.insert("Referer".into(), url);
+        }
         headers
     }
 }
@@ -586,8 +635,8 @@ mod tests {
             Vec2d { x: 60, y: 60 }
         }
 
-        fn tile_url(&self, pos: Vec2d) -> String {
-            format!("{},{}", pos.x, pos.y)
+        fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
+            Ok(format!("{},{}", pos.x, pos.y))
         }
 
         fn title(&self) -> Option<String> {
@@ -600,7 +649,7 @@ mod tests {
         let mut lvl: ZoomLevel = Box::<FakeLvl>::default();
         let mut all_tiles = vec![];
         let mut zoom_level_iter = ZoomLevelIter::new(&mut lvl);
-        while let Some(tiles) = zoom_level_iter.next_tile_references() {
+        while let Some(tiles) = zoom_level_iter.next_tile_references().unwrap() {
             all_tiles.extend(tiles);
             zoom_level_iter.set_fetch_result(TileFetchResult {
                 count: 0,

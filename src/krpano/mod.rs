@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use custom_error::custom_error;
 use itertools::Itertools;
 use log::warn;
+use thiserror::Error;
 
 use krpano_metadata::{KrpanoMetadata, TemplateString, TemplateStringPart, XY};
 
+use crate::ZoomError;
 use crate::dezoomer::*;
 use crate::krpano::krpano_metadata::{ImageInfo, LevelDesc};
 use crate::network::resolve_relative;
@@ -57,13 +58,18 @@ impl Dezoomer for KrpanoDezoomer {
     }
 }
 
-custom_error! {pub KrpanoError
-    XmlError{source: serde_xml_rs::Error} = "Unable to parse the krpano xml file: {source}",
+#[derive(Error, Debug)]
+pub enum KrpanoError {
+    #[error("Unable to parse the krpano xml file: {source}")]
+    XmlError {
+        #[from]
+        source: serde_xml_rs::Error,
+    },
 }
 
 impl From<KrpanoError> for DezoomerError {
     fn from(err: KrpanoError) -> Self {
-        DezoomerError::Other { source: err.into() }
+        DezoomerError::wrap(err)
     }
 }
 
@@ -232,7 +238,7 @@ impl TilesRect for Level {
         self.tile_size
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
         use std::fmt::Write;
         let mut result = String::new();
         for part in self.template.0.iter() {
@@ -253,7 +259,7 @@ impl TilesRect for Level {
                 }
             }
         }
-        resolve_relative(&self.base_url, &result)
+        Ok(resolve_relative(&self.base_url, &result))
     }
 
     fn title(&self) -> Option<String> {
@@ -265,11 +271,11 @@ impl TilesRect for Level {
         }
     }
 
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
-        TileReference {
-            url: self.tile_url(pos),
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos,
-        }
+        })
     }
 }
 
@@ -296,7 +302,7 @@ fn test_cube() {
     assert_eq!(levels[0].size_hint(), Some(Vec2d { x: 1000, y: 100 }));
     assert_eq!(format!("{:?}", levels[0]), "Krpano Cube forward");
     assert_eq!(
-        levels[0].next_tiles(None),
+        levels[0].next_tiles(None).unwrap(),
         vec![
             TileReference {
                 url: "http://example.com/f/1/1.jpg".to_string(),
@@ -326,7 +332,7 @@ fn test_flat_multires() {
     assert_eq!(levels[1].size_hint(), Some(Vec2d { x: 3, y: 4 }));
     assert_eq!(format!("{:?}", levels[0]), "Krpano Flat");
     assert_eq!(
-        levels[1].next_tiles(None),
+        levels[1].next_tiles(None).unwrap(),
         vec![
             TileReference {
                 url: "http://test.com/level=2%20x=01%20y=01".to_string(),

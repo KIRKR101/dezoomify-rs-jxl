@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::TileReference;
 use crate::dezoomer::*;
+use crate::errors::ZoomError;
 use crate::network::default_headers;
 
 mod tile_set;
@@ -19,10 +20,13 @@ impl Dezoomer for CustomDezoomer {
     }
 
     fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
-        self.assert(data.uri.ends_with("tiles.yaml"))?;
+        self.assert(
+            data.uri.to_lowercase().ends_with("tiles.yaml")
+                || data.uri.to_lowercase().ends_with("tiles.yml"),
+        )?;
         let contents = data.with_contents()?.contents;
         let dezoomer: CustomYamlTiles =
-            serde_yaml::from_slice(contents).map_err(DezoomerError::wrap)?;
+            serde_yml::from_slice(contents).map_err(DezoomerError::wrap)?;
         single_level(dezoomer)
     }
 }
@@ -45,16 +49,19 @@ impl std::fmt::Debug for CustomYamlTiles {
 }
 
 impl TileProvider for CustomYamlTiles {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
         if previous.is_some() {
-            return vec![];
+            return Ok(vec![]);
         }
         let tiles_result: Result<Vec<_>, _> = self.tile_set.into_iter().collect();
         match tiles_result {
-            Ok(tiles) => tiles,
+            Ok(tiles) => Ok(tiles),
             Err(err) => {
                 log::error!("Invalid tiles.yaml file: {err}\n");
-                vec![]
+                Ok(vec![])
             }
         }
     }
@@ -82,7 +89,7 @@ fn test_can_parse_example() {
 
     let yaml_path = format!("{}/tiles.yaml", env!("CARGO_MANIFEST_DIR"));
     let file = File::open(yaml_path).unwrap();
-    let conf: CustomYamlTiles = serde_yaml::from_reader(file).unwrap();
+    let conf: CustomYamlTiles = serde_yml::from_reader(file).unwrap();
     assert!(
         conf.http_headers().contains_key("Referer"),
         "There should be a referer in the example"
@@ -92,7 +99,7 @@ fn test_can_parse_example() {
 #[test]
 fn test_has_default_user_agent() {
     let conf: CustomYamlTiles =
-        serde_yaml::from_str("url_template: test.com\nvariables: []").unwrap();
+        serde_yml::from_str("url_template: test.com\nvariables: []").unwrap();
     assert!(
         conf.http_headers().contains_key("User-Agent"),
         "There should be a user agent"

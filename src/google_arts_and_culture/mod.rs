@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tile_info::{PageInfo, TileInfo};
 
+use crate::ZoomError;
 use crate::dezoomer::*;
 
 mod decryption;
@@ -54,10 +55,11 @@ impl Dezoomer for GAPDezoomer {
                     pyramid_level,
                     ..
                 } = serde_xml_rs::from_reader(contents).map_err(|e| {
+                    let preview = String::from_utf8_lossy(&contents[..contents.len().min(2048)]);
                     log::error!(
-                        "Failed to parse tile info XML: {}. Response was: {}",
+                        "Failed to parse tile info XML: {}. Response preview: {}",
                         e,
-                        String::from_utf8_lossy(contents)
+                        preview
                     );
                     DezoomerError::wrap(e)
                 })?;
@@ -111,9 +113,9 @@ impl TilesRect for GAPZoomLevel {
         self.tile_size
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
         let Vec2d { x, y } = pos;
-        url::compute_url(&self.page_info, x, y, self.z)
+        Ok(url::compute_url(&self.page_info, x, y, self.z))
     }
 
     fn post_process_fn(&self) -> PostProcessFn {
@@ -128,8 +130,8 @@ impl TilesRect for GAPZoomLevel {
 fn post_process_tile(
     _tile: &TileReference,
     data: Vec<u8>,
-) -> Result<Vec<u8>, Box<dyn Error + Send + 'static>> {
-    decryption::decrypt(data).map_err(|e| Box::new(e) as Box<dyn Error + Send + 'static>)
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync + 'static>> {
+    decryption::decrypt(data).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
 }
 
 impl std::fmt::Debug for GAPZoomLevel {
@@ -327,7 +329,7 @@ mod tests {
             page_info: Arc::clone(&page_info),
         };
 
-        let tile_url = level.tile_url(Vec2d { x: 1, y: 1 });
+        let tile_url = level.tile_url(Vec2d { x: 1, y: 1 }).unwrap();
         assert!(tile_url.starts_with("https://lh5.ggpht.com/test"));
         assert!(tile_url.contains("=x1-y1-z2-t"));
 

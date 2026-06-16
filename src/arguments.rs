@@ -20,14 +20,13 @@ pub struct Arguments {
 
     /// File to which the resulting image should be saved. By default the program will
     /// generate a name based on the image metadata if available. Otherwise, it will
-    /// generate a name in the format "dezoomified[_N].{jpg,png}" depending on which
-    /// files already exist in the current directory, and whether the target image size fits
-    /// in a JPEG or not.
+    /// generate a name in the format "dezoomified[_N].jxl".
     #[arg()]
     pub outfile: Option<PathBuf>,
 
     /// File to which the resulting image should be saved.
     /// This is an explicit alternative to the positional OUTFILE argument.
+    /// Cannot be combined with the positional OUTFILE; doing so is a usage error.
     #[arg(long = "outfile", conflicts_with = "outfile")]
     pub outfile_option: Option<PathBuf>,
 
@@ -84,13 +83,13 @@ pub struct Arguments {
     /// For lossy output formats such as jpeg, this affects the quality of the resulting image.
     /// 0 means less compression, 100 means more compression.
     /// Currently affects the JPEG, PNG, and JXL encoders.
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "5", value_parser = parse_compression)]
     pub compression: u8,
 
     /// Encoding effort for JXL output (1–9).
     /// 1 = fastest / least compression, 9 = slowest / best compression.
     /// When not set, effort scales with --compression.
-    #[arg(long = "jxl-effort")]
+    #[arg(long = "jxl-effort", value_parser = parse_jxl_effort)]
     pub jxl_effort: Option<u8>,
 
     /// Sets an HTTP header to use on requests.
@@ -109,7 +108,9 @@ pub struct Arguments {
     #[arg(long, default_value = "32")]
     pub max_idle_per_host: usize,
 
-    /// Whether to accept connecting to insecure HTTPS servers
+    /// Whether to accept connecting to insecure HTTPS servers.
+    /// WARNING: this disables TLS certificate validation and makes connections vulnerable
+    /// to man-in-the-middle attacks. Only use this when accessing trusted private servers.
     #[arg(long)]
     pub accept_invalid_certs: bool,
 
@@ -148,6 +149,11 @@ pub struct Arguments {
     /// In bulk mode, if no level-specifying argument is defined (such as --max-width), then --largest is implied.
     #[arg(long = "bulk")]
     pub bulk: Option<String>,
+
+    /// Number of images to process concurrently in bulk mode.
+    /// 1 (the default) preserves the original sequential behavior.
+    #[arg(long = "bulk-parallelism", default_value = "1")]
+    pub bulk_parallelism: usize,
 }
 
 impl Default for Arguments {
@@ -171,12 +177,13 @@ impl Default for Arguments {
             headers: vec![],
             max_idle_per_host: 32,
             accept_invalid_certs: false,
-            min_interval: Default::default(),
+            min_interval: Duration::from_millis(50),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(6),
             logging: "info".to_string(),
             tile_storage_folder: None,
             bulk: None,
+            bulk_parallelism: 1,
         }
     }
 }
@@ -261,15 +268,40 @@ fn parse_header(s: &str) -> Result<(String, String), &'static str> {
     }
 }
 
+fn parse_compression(s: &str) -> Result<u8, String> {
+    let value: u8 = s
+        .parse()
+        .map_err(|_| "Compression must be an integer between 0 and 100".to_string())?;
+    if value <= 100 {
+        Ok(value)
+    } else {
+        Err("Compression must be between 0 and 100".to_string())
+    }
+}
+
+fn parse_jxl_effort(s: &str) -> Result<u8, String> {
+    let value: u8 = s
+        .parse()
+        .map_err(|_| "JXL effort must be an integer between 1 and 9".to_string())?;
+    if (1..=9).contains(&value) {
+        Ok(value)
+    } else {
+        Err("JXL effort must be between 1 and 9".to_string())
+    }
+}
+
 fn parse_duration(s: &str) -> Result<Duration, &'static str> {
     let err_msg = "Invalid duration. \
                         A duration is a number followed by a unit, such as '10ms' or '5s'";
-    let re = Regex::new(r"^(\d+)\s*(min|s|ms|ns)$").unwrap();
+    let re = Regex::new(r"^(\d+)\s*(h|min|m|s|ms|ns)$").unwrap();
     let caps = re.captures(s).ok_or(err_msg)?;
     let val: u64 = caps[1].parse().map_err(|_| err_msg)?;
     match &caps[2] {
-        "h" => Ok(Duration::from_secs(3600 * val)),
-        "min" | "m" => Ok(Duration::from_secs(60 * val)),
+        "h" => val
+            .checked_mul(3600)
+            .map(Duration::from_secs)
+            .ok_or(err_msg),
+        "min" | "m" => val.checked_mul(60).map(Duration::from_secs).ok_or(err_msg),
         "s" => Ok(Duration::from_secs(val)),
         "ms" => Ok(Duration::from_millis(val)),
         "ns" => Ok(Duration::from_nanos(val)),
@@ -310,11 +342,29 @@ fn test_parse_duration() {
     assert_eq!(parse_duration("29 s"), Ok(Duration::from_secs(29)));
     assert_eq!(parse_duration("2min"), Ok(Duration::from_secs(120)));
     assert_eq!(parse_duration("1000 ms"), Ok(Duration::from_secs(1)));
+    assert_eq!(parse_duration("1m"), Ok(Duration::from_secs(60)));
+    assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
     assert!(parse_duration("1 2 ms").is_err());
     assert!(parse_duration("1 s s").is_err());
     assert!(parse_duration("ms").is_err());
     assert!(parse_duration("1j").is_err());
     assert!(parse_duration("").is_err());
+}
+
+#[test]
+fn test_max_height_short_flag() {
+    let args = Arguments::parse_from(["dezoomify-rs", "-h", "1000", "http://example.com"]);
+    assert_eq!(args.max_height, Some(1000));
+}
+
+#[test]
+fn test_help_short_flag() {
+    // '-?' triggers the help action and exits the parser.
+    let result = Arguments::try_parse_from(["dezoomify-rs", "-?"]);
+    assert!(matches!(
+        result.unwrap_err().kind(),
+        clap::error::ErrorKind::DisplayHelp
+    ));
 }
 
 #[test]
@@ -343,6 +393,23 @@ fn test_outfile_option_parsing() {
         "out.jpg",
     ]);
     assert_eq!(args.output_file(), Some(PathBuf::from("out.jpg")));
+}
+
+#[test]
+fn test_outfile_option_conflicts_with_positional() {
+    // The positional OUTFILE and the --outfile flag are mutually exclusive.
+    let result = Arguments::try_parse_from([
+        "dezoomify-rs",
+        "https://example.com/info.json",
+        "positional.jpg",
+        "--outfile",
+        "flag.jpg",
+    ]);
+    assert!(
+        result.is_err(),
+        "expected clap to reject conflicting positional and --outfile, got: {:?}",
+        result.map(|a| a.output_file())
+    );
 }
 
 #[test]

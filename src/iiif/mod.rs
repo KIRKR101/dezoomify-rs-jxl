@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use custom_error::custom_error;
 use log::{debug, warn};
+use thiserror::Error;
 
 use tile_info::ImageInfo;
 
+use crate::ZoomError;
 use crate::dezoomer::*;
 use crate::iiif::tile_info::TileSizeFormat;
 use crate::json_utils::all_json;
@@ -68,14 +69,20 @@ pub fn determine_title(image_info: &manifest_types::ExtractedImageInfo) -> Optio
     }
 }
 
-custom_error! {pub IIIFError
-    JsonError{source: serde_json::Error} = "Invalid IIIF info.json file: {source}",
-    ManifestParseError{description: String} = "Could not parse IIIF manifest: {description}",
+#[derive(Error, Debug)]
+pub enum IIIFError {
+    #[error("Invalid IIIF info.json file: {source}")]
+    JsonError {
+        #[from]
+        source: serde_json::Error,
+    },
+    #[error("Could not parse IIIF manifest: {description}")]
+    ManifestParseError { description: String },
 }
 
 impl From<IIIFError> for DezoomerError {
     fn from(err: IIIFError) -> Self {
-        DezoomerError::Other { source: err.into() }
+        DezoomerError::wrap(err)
     }
 }
 
@@ -273,12 +280,12 @@ impl TilesRect for IIIFZoomLevel {
         self.tile_size
     }
 
-    fn tile_url(&self, col_and_row_pos: Vec2d) -> String {
+    fn tile_url(&self, col_and_row_pos: Vec2d) -> Result<String, ZoomError> {
         let scaled_tile_size = self.tile_size * self.scale_factor;
         let xy_pos = col_and_row_pos * scaled_tile_size;
         let scaled_tile_size = max_size_in_rect(xy_pos, scaled_tile_size, self.page_info.size());
         let tile_size = scaled_tile_size / self.scale_factor;
-        format!(
+        Ok(format!(
             "{base}/{x},{y},{img_w},{img_h}/{tile_size}/{rotation}/{quality}.{format}",
             base = self
                 .page_info
@@ -297,7 +304,7 @@ impl TilesRect for IIIFZoomLevel {
             rotation = 0,
             quality = self.quality,
             format = self.format,
-        )
+        ))
     }
 }
 
@@ -372,7 +379,6 @@ fn is_legacy_presentation_manifest(value: &serde_json::Value) -> bool {
 }
 
 fn manifest_type(value: &serde_json::Value) -> Option<&str> {
-    
     value
         .get("type")
         .or_else(|| value.get("@type"))
@@ -446,20 +452,6 @@ fn parse_unknown_manifest(
 #[test]
 fn test_tiles() {
     let data = br#"{
-            .split('/')
-            .next_back()
-            .and_then(|s: &str| {
-                let s = s.trim();
-                if s.is_empty() { None } else { Some(s) }
-            })
-            .unwrap_or("IIIF Image");
-        write!(f, "{name}")
-    }
-}
-
-#[test]
-fn test_tiles() {
-    let data = br#"{
       "@context" : "http://iiif.io/api/image/2/context.json",
       "@id" : "http://www.asmilano.it/fast/iipsrv.fcgi?IIIF=/opt/divenire/files/./tifs/05/36/536765.tif",
       "protocol" : "http://iiif.io/api/image",
@@ -478,6 +470,7 @@ fn test_tiles() {
     let mut levels = zoom_levels("test.com", data).unwrap();
     let tiles: Vec<String> = levels[6]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -503,6 +496,7 @@ fn test_tiles_max_area_filter() {
     let mut levels = zoom_levels("http://ophir.dev/info.json", data).unwrap();
     let tiles: Vec<String> = levels[0]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -526,6 +520,7 @@ fn test_missing_id() {
     let mut levels = zoom_levels("http://test.com/info.json", data).unwrap();
     let tiles: Vec<String> = levels[0]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -572,7 +567,12 @@ fn test_qualities() {
     let mut levels = zoom_levels("test.com", data).unwrap();
     let level = &mut levels[0];
     assert_eq!(level.size_hint(), Some(Vec2d { x: 515, y: 381 })); // 5156/10, 3816/10
-    let tiles: Vec<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+    let tiles: Vec<String> = level
+        .next_tiles(None)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.url)
+        .collect();
     assert_eq!(
         tiles,
         vec![

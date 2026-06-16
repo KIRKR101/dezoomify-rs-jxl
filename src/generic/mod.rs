@@ -8,6 +8,7 @@ use crate::dezoomer::{
     Dezoomer, DezoomerError, DezoomerInput, TileFetchResult, TileProvider, TileReference,
     ZoomLevels, single_level,
 };
+use crate::errors::ZoomError;
 
 mod dichotomy_2d;
 
@@ -93,8 +94,11 @@ impl ZoomLevel {
 }
 
 impl TileProvider for ZoomLevel {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
-        if let Some(p) = previous {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
+        Ok(if let Some(p) = previous {
             self.tile_size = self.tile_size.or(p.tile_size);
             if let Some((x, y)) = self.dichotomy.next(p.is_success()) {
                 self.last_tile = (x, y);
@@ -118,13 +122,17 @@ impl TileProvider for ZoomLevel {
             }
         } else {
             vec![self.tile_ref_at(self.last_tile.0, self.last_tile.1)]
-        }
+        })
     }
     fn name(&self) -> String {
         format!("Generic image with template {}", self.url_template)
     }
     fn size_hint(&self) -> Option<Vec2d> {
         self.image_size
+    }
+
+    fn expects_failed_tiles(&self) -> bool {
+        true
     }
 }
 
@@ -155,7 +163,7 @@ fn test_generic_dezoomer() {
 
     let mut zoom_level_iter = crate::dezoomer::ZoomLevelIter::new(&mut lvl);
     let mut tries = 0;
-    while let Some(tiles) = zoom_level_iter.next_tile_references() {
+    while let Some(tiles) = zoom_level_iter.next_tile_references().unwrap() {
         let count = tiles.len() as u64;
 
         let successes: Vec<_> = tiles

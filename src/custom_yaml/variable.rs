@@ -3,8 +3,8 @@ use itertools::Itertools;
 use regex::Regex;
 use serde::Deserialize;
 
-use custom_error::custom_error;
 use lazy_static::lazy_static;
+use thiserror::Error;
 
 use self::VarOrConst::Var;
 
@@ -174,11 +174,19 @@ fn build_context() -> HashMapContext<DefaultNumericTypes> {
     // Add custom variables and functions here
 }
 
-custom_error! {pub BadVariableError
-    BadName{name: String} = "invalid variable name: '{name}'",
-    TooManyValues{name:String, steps:i64}= "the range of values for {name} is too wide: {steps} steps",
-    Infinite{name:String}= "the range of values for {name} is incorrect",
-    EvalError{source:evalexpr::EvalexprError} = "{source}",
+#[derive(Error, Debug)]
+pub enum BadVariableError {
+    #[error("invalid variable name: '{name}'")]
+    BadName { name: String },
+    #[error("the range of values for {name} is too wide: {steps} steps")]
+    TooManyValues { name: String, steps: i64 },
+    #[error("the range of values for {name} is incorrect")]
+    Infinite { name: String },
+    #[error("{source}")]
+    EvalError {
+        #[from]
+        source: evalexpr::EvalexprError,
+    },
 }
 
 #[cfg(test)]

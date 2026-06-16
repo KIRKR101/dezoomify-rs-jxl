@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use image::GenericImage;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, SubImage};
 use log::{debug, warn};
+use lru::LruCache;
 
 use crate::Vec2d;
 use crate::errors::image_error_to_io_error;
@@ -35,6 +37,13 @@ it is encoded to jpeg and saved to the target folder.
 
 Every level passes the source tile to it's child when it is done with it.
 **/
+/// Number of target-tile images to keep in memory per retiler level. The rest are
+/// spilled to temporary BMP files on disk.
+const TILE_IMAGE_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(64) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
 pub struct Retiler<T: TileSaver> {
     original_size: Vec2d,
     pub tile_size: Vec2d,
@@ -44,6 +53,8 @@ pub struct Retiler<T: TileSaver> {
     /// When a target tile has been entirely covered by source tiles, its entry is set to None
     tiles: HashMap<Vec2d, Option<TmpTile>>,
     tile_saver: Arc<T>,
+    /// In-memory cache for partial target-tile images. Evicted entries are written to disk.
+    tile_image_cache: LruCache<(Vec2d, u32), DynamicImage>,
 }
 
 struct TmpTile {
@@ -52,7 +63,7 @@ struct TmpTile {
 
 impl<T: TileSaver> Retiler<T> {
     pub fn new(size: Vec2d, tile_size: Vec2d, tile_saver: Arc<T>, scale_factor: u32) -> Retiler<T> {
-        let next_level = if (size / scale_factor).fits_inside(tile_size) {
+        let next_level = if size.ceil_div(scale_factor).fits_inside(tile_size) {
             None
         } else {
             let tile_saver = Arc::clone(&tile_saver);
@@ -66,11 +77,12 @@ impl<T: TileSaver> Retiler<T> {
             tiles: HashMap::new(),
             tile_saver,
             scale_factor,
+            tile_image_cache: LruCache::new(TILE_IMAGE_CACHE_SIZE),
         }
     }
 
     pub fn size(&self) -> Vec2d {
-        self.original_size / self.scale_factor
+        self.original_size.ceil_div(self.scale_factor)
     }
 
     fn tile_positions(&self, position: Vec2d, size: Vec2d) -> impl Iterator<Item = Vec2d> + use<T> {
@@ -112,31 +124,83 @@ impl<T: TileSaver> Retiler<T> {
             let cur_tile_size = max_size_in_rect(cur_pos, tile_size, self.original_size);
             let scaled_tile_size = cur_tile_size.ceil_div(scale_factor);
 
-            let tmp_tile_entry = self.tiles.entry(cur_pos).or_insert_with(|| {
-                debug!(
-                    "Creating a new partial tile at scale factor {scale_factor} position {cur_pos} size {cur_tile_size}"
-                );
-                Some(TmpTile::new(scaled_tile_size))
-            });
-            if let Some(tmp_tile) = tmp_tile_entry {
-                let finished = tmp_tile.add_tile(
-                    cur_pos,
-                    cur_tile_size,
-                    self.original_size,
-                    scale_factor,
-                    scaled_tile,
-                )?;
-                if let Some(tile_img) = finished {
-                    self.tile_save(cur_pos, cur_tile_size, tile_img)?;
-                    self.tiles.insert(cur_pos, None);
+            let is_pending = match self.tiles.get(&cur_pos) {
+                Some(None) => false,
+                Some(Some(_)) => true,
+                None => {
+                    debug!(
+                        "Creating a new partial tile at scale factor {scale_factor} position {cur_pos} size {cur_tile_size}"
+                    );
+                    self.tiles
+                        .insert(cur_pos, Some(TmpTile::new(scaled_tile_size)));
+                    true
                 }
-            } else {
+            };
+            if !is_pending {
                 debug!(
                     "Source tiles overlap:\
                         Received pixels for tile at {} on level {}, but this tile has already been written.\
                         Ignoring them (source tiles overlap).",
                     cur_pos, self.scale_factor
-                )
+                );
+                continue;
+            }
+
+            let key = (cur_pos, scale_factor);
+            let tmp_tile_path = TmpTile::path(cur_pos, scale_factor);
+            let scaled_self_position = cur_pos / scale_factor;
+            let scaled_level_size = self.original_size.ceil_div(scale_factor);
+            let self_bottom_right = (cur_pos + cur_tile_size)
+                .ceil_div(scale_factor)
+                .min(scaled_level_size);
+            let top_left = scaled_tile.position() - scaled_self_position;
+            let bottom_right =
+                scaled_tile.bottom_right().min(self_bottom_right) - scaled_self_position;
+            let sub_tile_img =
+                crop_image_for_tile(scaled_tile, scaled_self_position, scaled_tile_size);
+
+            let finished_image = {
+                let tmp_tile = self.tiles.get_mut(&cur_pos).unwrap().as_mut().unwrap();
+                let mut tile_img =
+                    take_or_create_image(&mut self.tile_image_cache, key, scaled_tile_size);
+
+                tile_img
+                    .copy_from(&*sub_tile_img, top_left.x, top_left.y)
+                    .map_err(|_err| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tile too large for image")
+                    })?;
+
+                tmp_tile.set_done_pixels(scaled_tile_size, top_left, bottom_right);
+
+                if tmp_tile.is_complete() {
+                    debug!(
+                        "Removing completed tile of level {} at position {}: {:?}",
+                        self.original_size, cur_pos, tmp_tile_path
+                    );
+                    self.tile_image_cache.pop(&key);
+                    let _ = std::fs::remove_file(&tmp_tile_path);
+                    Some(tile_img)
+                } else {
+                    if let Some((evicted_key, evicted_img)) =
+                        self.tile_image_cache.push(key, tile_img)
+                    {
+                        // Cache is full: spill the least-recently used tile to disk.
+                        let (pos, scale) = evicted_key;
+                        let spill_path = TmpTile::path(pos, scale);
+                        if let Err(e) = evicted_img
+                            .save(spill_path.as_path())
+                            .map_err(image_error_to_io_error)
+                        {
+                            warn!("Unable to spill retiler tile to {spill_path:?}: {e}");
+                        }
+                    }
+                    None
+                }
+            };
+
+            if let Some(tile_img) = finished_image {
+                self.tile_save(cur_pos, cur_tile_size, tile_img)?;
+                self.tiles.insert(cur_pos, None);
             }
         }
 
@@ -159,10 +223,15 @@ impl<T: TileSaver> Retiler<T> {
                     position,
                     tile.missing_pixels()
                 );
+                let key = (position, self.scale_factor);
+                let tile_img = take_or_create_image(
+                    &mut self.tile_image_cache,
+                    key,
+                    cur_tile_size.ceil_div(self.scale_factor),
+                );
                 let tmp_tile_path = TmpTile::path(position, self.scale_factor);
-                let result = image::open(&tmp_tile_path)
-                    .map_err(image_error_to_io_error)
-                    .and_then(|image| self.tile_save(position, cur_tile_size, image))
+                let result = self
+                    .tile_save(position, cur_tile_size, tile_img)
                     .and_then(|()| std::fs::remove_file(&tmp_tile_path));
                 if let Err(e) = result {
                     warn!(
@@ -170,6 +239,9 @@ impl<T: TileSaver> Retiler<T> {
                 when trying to add the partial tile to the final image: {e}"
                     )
                 }
+                // Ensure the cache entry for this tile is removed so it is not
+                // written back to disk when the retiler is dropped.
+                self.tile_image_cache.pop(&key);
             }
         }
         if let Some(next_level) = &mut self.next_level {
@@ -204,6 +276,10 @@ impl TmpTile {
         }
     }
 
+    fn is_complete(&self) -> bool {
+        self.done_pixels.count_ones(..) == self.done_pixels.len()
+    }
+
     fn missing_pixels(&self) -> usize {
         self.done_pixels.len() - self.done_pixels.count_ones(..)
     }
@@ -213,56 +289,6 @@ impl TmpTile {
             let start = (y * self_size.x + top_left.x) as usize;
             let end = (y * self_size.x + bottom_right.x) as usize;
             self.done_pixels.insert_range(start..end);
-        }
-    }
-
-    fn add_tile(
-        &mut self,
-        self_position: Vec2d,
-        self_size: Vec2d,
-        level_size: Vec2d,
-        scale_factor: u32,
-        tile: &Tile,
-    ) -> io::Result<Option<DynamicImage>> {
-        let scaled_self_position = self_position / scale_factor;
-        let top_left = tile.position() - scaled_self_position;
-        let scaled_level_size = level_size.ceil_div(scale_factor);
-        let self_bottom_right = (self_position + self_size)
-            .ceil_div(scale_factor)
-            .min(scaled_level_size);
-        let bottom_right = tile.bottom_right().min(self_bottom_right) - scaled_self_position;
-        let scaled_size = self_size.ceil_div(scale_factor);
-
-        let tmp_tile_path = Self::path(self_position, scale_factor);
-        debug!(
-            "Opening partial tile of size {} at {:?} in order to paste pixels from {} to {}",
-            scaled_size, &tmp_tile_path, top_left, bottom_right
-        );
-        let mut tile_img = image::open(&tmp_tile_path)
-            .unwrap_or_else(|_| image::DynamicImage::new_rgb8(scaled_size.x, scaled_size.y));
-        debug_assert_eq!(scaled_size, tile_img.dimensions().into());
-        let sub_tile_img = crop_image_for_tile(tile, scaled_self_position, scaled_size);
-        tile_img
-            .copy_from(&*sub_tile_img, top_left.x, top_left.y)
-            .map_err(|_err| {
-                io::Error::new(io::ErrorKind::InvalidData, "tile too large for image")
-            })?;
-
-        self.set_done_pixels(scaled_size, top_left, bottom_right);
-        if self.missing_pixels() == 0 {
-            // The tile has been fully covered by pixels
-            debug!(
-                "Removing completed tile of level {} at position {}: {:?}",
-                level_size, self_position, &tmp_tile_path
-            );
-            let _ = std::fs::remove_file(&tmp_tile_path);
-            Ok(Some(tile_img))
-        } else {
-            debug!("Writing partly-filled tile of level {level_size} at position {self_position}");
-            tile_img
-                .save(&tmp_tile_path)
-                .map_err(image_error_to_io_error)?;
-            Ok(None)
         }
     }
 
@@ -291,6 +317,27 @@ fn crop_image_for_tile(
     source_tile
         .image
         .view(crop_position.x, crop_position.y, crop_size.x, crop_size.y)
+}
+
+/// Retrieve a partial tile image from the in-memory cache, fall back to its
+/// temporary file, or create a new blank RGB image if neither exists.
+///
+/// Pulled out as a free function so both `Retiler::add_tile` and
+/// `Retiler::finalize` can share the same logic without tripping the borrow
+/// checker when they also need to mutate `self.tiles` or `self.tile_image_cache`.
+fn take_or_create_image(
+    tile_image_cache: &mut LruCache<(Vec2d, u32), DynamicImage>,
+    key: (Vec2d, u32),
+    size: Vec2d,
+) -> DynamicImage {
+    if let Some(img) = tile_image_cache.pop(&key) {
+        return img;
+    }
+    let path = TmpTile::path(key.0, key.1);
+    if let Ok(img) = image::open(&path) {
+        return img;
+    }
+    DynamicImage::new_rgb8(size.x, size.y)
 }
 
 #[cfg(test)]

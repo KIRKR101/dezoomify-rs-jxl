@@ -4,7 +4,7 @@ use image::{
 };
 use log::debug;
 use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::encoder::Encoder;
@@ -46,6 +46,7 @@ impl<Pix: Pixel> Canvas<Pix> {
         })
     }
 
+    #[cfg(test)]
     pub fn new_jxl_rgba(
         destination: PathBuf,
         size: Vec2d,
@@ -59,6 +60,146 @@ impl<Pix: Pixel> Canvas<Pix> {
             icc_profile: None,
             exif_metadata: None,
         })
+    }
+
+    pub fn new_jxl_rgb(
+        destination: PathBuf,
+        size: Vec2d,
+        quality: u8,
+        effort: u8,
+    ) -> Result<Canvas<Rgb<u8>>, ZoomError> {
+        Ok(Canvas::<Rgb<u8>> {
+            image: ImageBuffer::new(size.x, size.y),
+            destination,
+            image_writer: ImageWriter::Jxl { quality, effort },
+            icc_profile: None,
+            exif_metadata: None,
+        })
+    }
+}
+
+impl Canvas<Rgb<u8>> {
+    /// Promote an RGB canvas to RGBA, preserving its writer and metadata.
+    /// This is intended for JXL output that started opaque and then received
+    /// a tile with an alpha channel.
+    pub fn into_rgba(self) -> Canvas<Rgba<u8>> {
+        debug_assert!(
+            matches!(self.image_writer, ImageWriter::Jxl { .. }),
+            "into_rgba is only valid for JXL canvases"
+        );
+        let Canvas {
+            image,
+            destination,
+            image_writer,
+            icc_profile,
+            exif_metadata,
+        } = self;
+
+        let (width, height) = image.dimensions();
+        let pixel_count = (width * height) as usize;
+
+        // Reuse the existing RGB allocation and expand it in place to RGBA.
+        // This avoids holding both the old RGB buffer and a new RGBA buffer
+        // simultaneously, which would temporarily double peak memory.
+        let mut raw = image.into_raw();
+        raw.resize(pixel_count * 4, 255);
+        for i in (0..pixel_count).rev() {
+            let src = i * 3;
+            let dst = i * 4;
+            // Copy backwards within the pixel so the source bytes are not
+            // overwritten before they are read (dst > src for all i > 0).
+            raw[dst + 2] = raw[src + 2];
+            raw[dst + 1] = raw[src + 1];
+            raw[dst] = raw[src];
+            raw[dst + 3] = 255;
+        }
+        let rgba_image = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, raw)
+            .expect("RGB to RGBA conversion produced correct size");
+
+        Canvas::<Rgba<u8>> {
+            image: rgba_image,
+            destination,
+            image_writer,
+            icc_profile,
+            exif_metadata,
+        }
+    }
+}
+
+/// A canvas that starts as RGB8 and transparently promotes to RGBA8 if any
+/// incoming tile contains an alpha channel. This keeps memory low for the
+/// common opaque case while still supporting transparency when needed.
+pub(crate) enum DynamicCanvas {
+    Rgb(Canvas<Rgb<u8>>),
+    Rgba(Canvas<Rgba<u8>>),
+    Empty,
+}
+
+impl DynamicCanvas {
+    pub fn new_jxl(
+        destination: PathBuf,
+        size: Vec2d,
+        quality: u8,
+        effort: u8,
+    ) -> Result<Self, ZoomError> {
+        Ok(DynamicCanvas::Rgb(Canvas::<Rgb<u8>>::new_jxl_rgb(
+            destination,
+            size,
+            quality,
+            effort,
+        )?))
+    }
+}
+
+fn tile_has_alpha(tile: &Tile) -> bool {
+    tile.image.color().has_alpha()
+}
+
+impl Encoder for DynamicCanvas {
+    fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
+        if tile_has_alpha(&tile) {
+            let canvas = std::mem::replace(self, DynamicCanvas::Empty);
+            *self = match canvas {
+                DynamicCanvas::Rgb(rgb) => DynamicCanvas::Rgba(rgb.into_rgba()),
+                DynamicCanvas::Rgba(rgba) => DynamicCanvas::Rgba(rgba),
+                DynamicCanvas::Empty => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DynamicCanvas was empty while adding a tile",
+                    ));
+                }
+            };
+        }
+
+        match self {
+            DynamicCanvas::Rgb(canvas) => canvas.add_tile(tile),
+            DynamicCanvas::Rgba(canvas) => canvas.add_tile(tile),
+            DynamicCanvas::Empty => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DynamicCanvas was empty while adding a tile",
+            )),
+        }
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        match self {
+            DynamicCanvas::Rgb(canvas) => canvas.finalize(),
+            DynamicCanvas::Rgba(canvas) => canvas.finalize(),
+            DynamicCanvas::Empty => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DynamicCanvas was empty while finalizing",
+            )),
+        }
+    }
+
+    fn size(&self) -> Vec2d {
+        match self {
+            DynamicCanvas::Rgb(canvas) => canvas.size(),
+            DynamicCanvas::Rgba(canvas) => canvas.size(),
+            DynamicCanvas::Empty => {
+                panic!("DynamicCanvas was empty while reading its size")
+            }
+        }
     }
 }
 
@@ -300,11 +441,19 @@ impl ImageWriter {
                 .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
         }
 
-        let encoded = encoder
-            .encode_frame(raw, has_alpha, quality as f32, effort, exif_metadata.as_deref())
+        let file = File::create(destination).map_err(ImageError::IoError)?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        encoder
+            .encode_frame(
+                &mut writer,
+                raw,
+                has_alpha,
+                f32::from(quality),
+                effort,
+                exif_metadata.as_deref(),
+            )
             .map_err(|e| ImageError::IoError(std::io::Error::other(e)))?;
-
-        std::fs::write(destination, &encoded).map_err(ImageError::IoError)?;
+        writer.flush().map_err(ImageError::IoError)?;
         Ok(())
     }
 
@@ -313,7 +462,7 @@ impl ImageWriter {
         image: &CanvasBuffer<Pix>,
         destination: &Path,
         icc_profile: Option<&[u8]>,
-        exif_metadata: Option<&[u8]>,
+        _exif_metadata: Option<&[u8]>,
     ) -> ImageResult<()> {
         let extension = destination
             .extension()
@@ -322,18 +471,6 @@ impl ImageWriter {
             .to_lowercase();
 
         match extension.as_str() {
-            "jxl" => {
-                let quality = 80u8;
-                let effort = 7u8;
-                self.write_jxl(
-                    image,
-                    destination,
-                    &icc_profile.map(|p| p.to_vec()),
-                    &exif_metadata.map(|p| p.to_vec()),
-                    quality,
-                    effort,
-                )?;
-            }
             "png" => {
                 if let Some(profile) = icc_profile {
                     Self::encode_with_icc_profile::<
@@ -676,7 +813,8 @@ mod tests {
     fn test_jxl_canvas_full_pipeline_rgba() {
         let destination = temp_dir().join("dezoomify-rs-jxl-pipeline.jxl");
         let size = Vec2d { x: 2, y: 2 };
-        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
+        let mut canvas =
+            Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
 
         canvas
             .add_tile(
@@ -742,10 +880,47 @@ mod tests {
     }
 
     #[test]
+    fn test_rgb_to_rgba_promotion_reuses_allocation() {
+        let destination = temp_dir().join("dezoomify-rs-jxl-rgb-promotion.jxl");
+        let size = Vec2d { x: 3, y: 2 };
+        let mut canvas = Canvas::<Rgb<u8>>::new_jxl_rgb(destination, size, 100, 7).unwrap();
+
+        // Fill the RGB canvas with a simple pattern.
+        canvas
+            .add_tile(
+                Tile::builder()
+                    .at_position(Vec2d { x: 0, y: 0 })
+                    .with_image(DynamicImage::ImageRgb8(
+                        ImageBuffer::from_raw(
+                            3,
+                            2,
+                            vec![
+                                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+                                160, 170, 180,
+                            ],
+                        )
+                        .unwrap(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
+
+        let rgba_canvas = canvas.into_rgba();
+        assert_eq!(rgba_canvas.image.dimensions(), (3, 2));
+
+        let expected: Vec<u8> = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255, 130, 140, 150,
+            255, 160, 170, 180, 255,
+        ];
+        assert_eq!(rgba_canvas.image.as_raw(), &expected);
+    }
+
+    #[test]
     fn test_jxl_rgba_alpha_preserved() {
         let destination = temp_dir().join("dezoomify-rs-jxl-alpha.jxl");
         let size = Vec2d { x: 2, y: 2 };
-        let mut canvas = Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
+        let mut canvas =
+            Canvas::<Rgba<u8>>::new_jxl_rgba(destination.clone(), size, 100, 7).unwrap();
 
         canvas
             .add_tile(

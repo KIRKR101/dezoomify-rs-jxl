@@ -1,15 +1,16 @@
 use crate::Vec2d;
+use crate::ZoomError;
 use crate::dezoomer::{
     Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, IntoZoomLevels, TilesRect,
     ZoomLevels,
 };
-use custom_error::custom_error;
 use regex::Regex;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::iter::successors;
 use std::str::FromStr;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// A dezoomer for krpano images
 /// See https://iipimage.sourceforge.io/documentation/protocol/
@@ -86,14 +87,14 @@ impl TilesRect for Level {
         self.metadata.tile_size
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
         let Vec2d { x: width, .. } = self.size().ceil_div(self.tile_size());
-        format!(
+        Ok(format!(
             "{base}&JTL={level},{tile_index}",
             base = self.base,
             level = self.level,
             tile_index = y * width + x
-        )
+        ))
     }
 }
 
@@ -152,9 +153,15 @@ impl TryFrom<&[u8]> for Metadata {
     }
 }
 
-custom_error! {#[derive(PartialEq, Eq)] pub IIPError
-    MissingKey{key: &'static str} = "missing key '{key}' in the IIPImage metadata file",
-    Utf8{source: std::str::Utf8Error} = "Invalid IIPImage metadata file: {source}",
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum IIPError {
+    #[error("missing key '{key}' in the IIPImage metadata file")]
+    MissingKey { key: &'static str },
+    #[error("Invalid IIPImage metadata file: {source}")]
+    Utf8 {
+        #[from]
+        source: std::str::Utf8Error,
+    },
 }
 
 #[cfg(test)]
@@ -205,11 +212,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            levels[0].tile_url(Vec2d { x: 0, y: 0 }),
+            levels[0].tile_url(Vec2d { x: 0, y: 0 }).unwrap(),
             "http://test.com/&JTL=0,0"
         );
         assert_eq!(
-            levels[1].tile_url(Vec2d { x: 0, y: 1 }),
+            levels[1].tile_url(Vec2d { x: 0, y: 1 }).unwrap(),
             "http://test.com/&JTL=1,2"
         );
     }

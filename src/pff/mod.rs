@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use custom_error::custom_error;
 /// Dezoomer for the zoomify PFF servlet API format
 /// See: https://github.com/lovasoa/pff-extract/wiki/Zoomify-PFF-file-format-documentation
 use serde_urlencoded as urlencoded;
@@ -8,9 +7,10 @@ use serde_urlencoded as urlencoded;
 use image_properties::PffHeader;
 use image_properties::Reply;
 
+use crate::ZoomError;
 use crate::dezoomer::*;
 use crate::pff::image_properties::{
-    HeaderInfo, ImageInfo, InitialServletRequestParams, RequestType, TileIndices,
+    HeaderInfo, ImageInfo, InitialServletRequestParams, PffError, RequestType, TileIndices,
 };
 
 mod image_properties;
@@ -24,14 +24,17 @@ pub enum PFF {
     WithHeader(HeaderInfo),
 }
 
-custom_error! {pub PffError
-    DecodeError{source: serde_urlencoded::de::Error} = "Invalid meta information file: {source}",
-    EncodeError{source: serde_urlencoded::ser::Error} = "Unable to generate URL: {source}",
-}
-
 impl From<PffError> for DezoomerError {
     fn from(err: PffError) -> Self {
-        DezoomerError::Other { source: err.into() }
+        DezoomerError::wrap(err)
+    }
+}
+
+impl From<PffError> for ZoomError {
+    fn from(err: PffError) -> Self {
+        ZoomError::TileUrl {
+            source: crate::errors::TileUrlError::from(err),
+        }
     }
 }
 
@@ -124,10 +127,28 @@ impl TilesRect for PffZoomLevel {
         Vec2d { x: size, y: size }
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
         let num_tiles_x = (self.size().ceil_div(self.tile_size())).x;
-        let i = self.tiles_before + pos.x + pos.y * num_tiles_x;
-        self.image_info.tile_url(i as usize)
+        // Check the largest product first so a u32 wrap on `pos.y * num_tiles_x`
+        // is caught before any `checked_add` ever sees it.
+        let i = pos
+            .y
+            .checked_mul(num_tiles_x)
+            .and_then(|p| p.checked_add(self.tiles_before))
+            .and_then(|s| s.checked_add(pos.x))
+            .ok_or_else(|| ZoomError::Dezoomer {
+                source: DezoomerError::Other {
+                    source: format!(
+                        "PFF tile index overflow at position {:?} \
+                         (tiles_before={}, pos.x={}, pos.y={}, num_tiles_x={})",
+                        pos, self.tiles_before, pos.x, pos.y, num_tiles_x
+                    )
+                    .into(),
+                },
+            })?;
+        self.image_info
+            .tile_url(i as usize)
+            .map_err(ZoomError::from)
     }
 }
 

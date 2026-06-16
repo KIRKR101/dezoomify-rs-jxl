@@ -1,8 +1,8 @@
 use crate::binary_display::display_bytes;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
-use custom_error::custom_error;
 use log::trace;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use thiserror::Error;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 /// Decrypt an encrypted image
@@ -81,11 +81,19 @@ fn read_size<T: Read>(c: T, dest: &mut Vec<u8>, size: u64) -> Result<T, std::io:
     Ok(wrapper.into_inner())
 }
 
-custom_error! {pub InvalidEncryptedImage
-    BadHeaderSize{header_size:u64} = "The size of the unencrypted header ({header_size}) is invalid.",
-    BadEncryptedSize{encrypted_size:u64} = "The size of the encrypted data ({encrypted_size}) is invalid.",
-    DecryptError = "Unable to decrypt the encrypted data",
-    IO{source: std::io::Error} = "Unable to read from the buffer: {source}",
+#[derive(Error, Debug)]
+pub enum InvalidEncryptedImage {
+    #[error("The size of the unencrypted header ({header_size}) is invalid.")]
+    BadHeaderSize { header_size: u64 },
+    #[error("The size of the encrypted data ({encrypted_size}) is invalid.")]
+    BadEncryptedSize { encrypted_size: u64 },
+    #[error("Unable to decrypt the encrypted data")]
+    DecryptError,
+    #[error("Unable to read from the buffer: {source}")]
+    IO {
+        #[from]
+        source: std::io::Error,
+    },
 }
 
 #[test]

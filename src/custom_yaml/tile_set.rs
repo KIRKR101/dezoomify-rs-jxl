@@ -4,9 +4,9 @@ use std::str::FromStr;
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
 
-use custom_error::custom_error;
 use evalexpr::DefaultNumericTypes;
 use lazy_static::lazy_static;
+use thiserror::Error;
 
 use crate::{TileReference, Vec2d};
 
@@ -207,11 +207,29 @@ impl UrlPart {
     }
 }
 
-custom_error! {pub UrlTemplateError
-    BadExpression{expr:String, source:evalexpr::EvalexprError} = "'{expr}' is not a valid expression: {source}",
-    EvalError{source:evalexpr::EvalexprError} = "{source}",
-    NumberError{source:std::num::TryFromIntError} = "Number too large: {source}",
-    BadVariable{source: BadVariableError} = "Invalid variable: {source}"
+#[derive(Error, Debug)]
+pub enum UrlTemplateError {
+    #[error("'{expr}' is not a valid expression: {source}")]
+    BadExpression {
+        expr: String,
+        #[source]
+        source: evalexpr::EvalexprError,
+    },
+    #[error("{source}")]
+    EvalError {
+        #[from]
+        source: evalexpr::EvalexprError,
+    },
+    #[error("Number too large: {source}")]
+    NumberError {
+        #[from]
+        source: std::num::TryFromIntError,
+    },
+    #[error("Invalid variable: {source}")]
+    BadVariable {
+        #[from]
+        source: BadVariableError,
+    },
 }
 
 #[cfg(test)]
@@ -279,7 +297,7 @@ variables:
       value: 100
 url_template: "{{x*tile_size}}/{{y*tile_size}}"
         "#;
-        let ts: TileSet = serde_yaml::from_str(serialized).unwrap();
+        let ts: TileSet = serde_yml::from_str(serialized).unwrap();
         let tile_refs: Vec<_> = ts.into_iter().collect::<Result<_, _>>().unwrap();
         let expected: Vec<_> = vec!["0 0 0/0", "0 1 0/100", "1 0 100/0", "1 1 100/100"]
             .into_iter()

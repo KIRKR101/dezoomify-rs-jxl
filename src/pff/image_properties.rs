@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use custom_error::custom_error;
+use thiserror::Error;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Reply<T: FromStr>
@@ -82,21 +82,30 @@ pub struct ImageInfo {
 }
 
 impl ImageInfo {
-    pub fn tile_url(&self, tile_number: usize) -> String {
+    pub fn tile_url(&self, tile_number: usize) -> Result<String, PffError> {
         let header = &self.header_info.header;
         let tiles = &self.tiles;
+        if tile_number >= tiles.indices.len() {
+            return Err(PffError::InvalidTileNumber {
+                tile_number,
+                num_tiles: tiles.indices.len(),
+            });
+        }
+        // The outer bounds check guarantees `tile_number < tiles.indices.len()`,
+        // so `checked_sub(1)` only fails for `tile_number == 0`, in which case
+        // there is no previous index and we use the file's first-tile offset.
         let begin = if let Some(i) = tile_number.checked_sub(1) {
             tiles.indices[i]
         } else {
             0x424 + header.header_size + 8 * u64::from(header.num_tiles)
         };
-        self.header_info.request_url(ServletRequestParams {
+        Ok(self.header_info.request_url(ServletRequestParams {
             vers: header.version,
             head: header.header_size,
             begin,
             end: tiles.indices[tile_number],
             request_type: RequestType::TileImage as u8,
-        })
+        }))
     }
 }
 
@@ -105,9 +114,52 @@ pub struct TileIndices {
     indices: Vec<u64>,
 }
 
-custom_error! {#[derive(PartialEq, Eq)] pub ParseTileIndicesError
-    TooShort = "Missing a part of tile indices string",
-    BadNum{source: ParseIntError} = "Invalid tile index: {source}",
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum ParseTileIndicesError {
+    #[error("Missing a part of tile indices string")]
+    TooShort,
+    #[error("Invalid tile index: {source}")]
+    BadNum {
+        #[from]
+        source: ParseIntError,
+    },
+}
+
+#[derive(Error, Debug)]
+pub enum PffError {
+    #[error("Invalid meta information file: {source}")]
+    DecodeError {
+        #[from]
+        source: serde_urlencoded::de::Error,
+    },
+    #[error("Unable to generate URL: {source}")]
+    EncodeError {
+        #[from]
+        source: serde_urlencoded::ser::Error,
+    },
+    #[error("Invalid tile number {tile_number}, only {num_tiles} tiles are available")]
+    InvalidTileNumber {
+        tile_number: usize,
+        num_tiles: usize,
+    },
+}
+
+impl From<PffError> for crate::errors::TileUrlError {
+    fn from(err: PffError) -> Self {
+        match err {
+            PffError::InvalidTileNumber {
+                tile_number,
+                num_tiles,
+            } => crate::errors::TileUrlError::InvalidTileNumber {
+                tile_number,
+                num_tiles,
+            },
+            // The remaining variants are produced while deserializing metadata or
+            // encoding servlet params, not while generating a per-tile URL. They
+            // can only be reached via programmer error; surface the message verbatim.
+            other => crate::errors::TileUrlError::Other(other.to_string()),
+        }
+    }
 }
 
 impl FromStr for TileIndices {

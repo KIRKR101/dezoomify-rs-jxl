@@ -1,17 +1,18 @@
 use std::collections::hash_map::DefaultHasher;
-use std::default::Default;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use image::{self, DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView};
 use image_hasher::HasherConfig;
+#[allow(unused_imports)]
 use jpegxl_rs::image::ToDynamic;
 use tempfile::Builder as TempDirBuilder;
 
-use dezoomify_rs::{Arguments, ZoomError, dezoomify, process_bulk};
+use dezoomify_rs::{Arguments, ZoomError, dezoomify_with_cancel, process_bulk_with_cancel};
+use tokio_util::sync::CancellationToken;
 
 /// Dezoom a file locally
 #[tokio::test(flavor = "multi_thread")]
@@ -48,7 +49,9 @@ pub async fn local_zoomify_tiles_to_jxl() {
     let output_path = tmp_file.to_path_buf();
     args.outfile = Some(output_path.clone());
 
-    dezoomify(&args).await.expect("Dezooming to JXL failed");
+    dezoomify_with_cancel(&args, CancellationToken::new())
+        .await
+        .expect("Dezooming to JXL failed");
 
     assert!(output_path.exists(), "JXL output file should exist");
 
@@ -109,7 +112,9 @@ pub async fn local_generic_tiles_to_jxl() {
     let output_path = tmp_file.to_path_buf();
     args.outfile = Some(output_path.clone());
 
-    dezoomify(&args).await.expect("Dezooming generic tiles to JXL failed");
+    dezoomify_with_cancel(&args, CancellationToken::new())
+        .await
+        .expect("Dezooming generic tiles to JXL failed");
 
     assert!(output_path.exists(), "JXL output file should exist");
     assert!(
@@ -188,7 +193,9 @@ pub async fn dezoom_image<'a>(input: &str, expected: &'a str) -> Result<TmpFile<
 
     let tmp_file = TmpFile(expected);
     args.outfile = Some(tmp_file.to_path_buf());
-    dezoomify(&args).await.expect("Dezooming failed");
+    dezoomify_with_cancel(&args, CancellationToken::new())
+        .await
+        .expect("Dezooming failed");
     Ok(tmp_file)
 }
 
@@ -248,7 +255,24 @@ fn hash<T: Hash>(v: T) -> u64 {
     s.finish()
 }
 
-#[allow(dead_code)]
+/// RAII guard that temporarily changes the current working directory.
+struct CurrentDirGuard(PathBuf);
+
+impl CurrentDirGuard {
+    fn new(dir: &Path) -> Self {
+        let original = std::env::current_dir().expect("failed to get current directory");
+        std::env::set_current_dir(dir).expect("failed to set current directory");
+        Self(original)
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        // Best-effort restore; panicking in Drop is discouraged.
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 async fn test_bulk_processing() -> Result<(), ZoomError> {
     // Get workspace root to use absolute paths
     let workspace_root = get_workspace_root();
@@ -286,7 +310,7 @@ async fn test_bulk_processing() -> Result<(), ZoomError> {
     args.outfile = Some(output_base.clone());
 
     // Execute bulk processing using the new unified architecture
-    let stats = process_bulk(&args).await?;
+    let stats = process_bulk_with_cancel(&args, CancellationToken::new()).await?;
 
     // Verify statistics
     assert_eq!(
@@ -335,10 +359,7 @@ async fn test_bulk_processing() -> Result<(), ZoomError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn test_bulk_mode_cli_end_to_end() -> Result<(), ZoomError> {
-    use std::env;
-
     // Get workspace root to use absolute paths
     let workspace_root = get_workspace_root();
 
@@ -365,9 +386,6 @@ async fn test_bulk_mode_cli_end_to_end() -> Result<(), ZoomError> {
 
     // Set up output file path in temp directory
     let output_file = temp_dir.path().join("cli_bulk_test.jpg");
-
-    // Save current directory and change to the project root for the test
-    let _original_dir = env::current_dir().unwrap(); // Keep reference for safety
 
     // Create CLI arguments as they would come from command line
     // Note: When using --bulk, outfile should not be provided as positional argument
@@ -396,7 +414,7 @@ async fn test_bulk_mode_cli_end_to_end() -> Result<(), ZoomError> {
     assert!(parsed_args.outfile.is_some());
 
     // Test the complete bulk processing flow using the new unified architecture
-    let stats = process_bulk(&parsed_args)
+    let stats = process_bulk_with_cancel(&parsed_args, CancellationToken::new())
         .await
         .expect("Bulk processing should succeed");
 
@@ -491,15 +509,12 @@ async fn test_bulk_mode_uses_image_titles_for_iiif_manifest() {
     args.retries = 0;
     args.logging = "error".into();
 
-    // Set the working directory to the test temp dir for output
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&temp_dir).unwrap();
+    // Run bulk processing with the temp dir as the working directory,
+    // restoring the original directory when the guard is dropped.
+    let _dir_guard = CurrentDirGuard::new(temp_dir.path());
 
     // Run bulk processing
-    let result = process_bulk(&args).await;
-
-    // Restore original directory
-    std::env::set_current_dir(&original_dir).unwrap();
+    let result = process_bulk_with_cancel(&args, CancellationToken::new()).await;
 
     let stats = result.unwrap();
     assert_eq!(stats.total_images, 1);
@@ -567,7 +582,9 @@ async fn test_bulk_mode_with_outfile_specified_still_uses_titles_in_naming() {
     // Set a custom outfile - this should result in index-based naming but still use the title
     args.outfile = Some(temp_dir.path().join("my_collection.jpg"));
 
-    let stats = process_bulk(&args).await.unwrap();
+    let stats = process_bulk_with_cancel(&args, CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(stats.total_images, 1);
     assert_eq!(stats.successful_images, 1);
 

@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use custom_error::custom_error;
 use log::debug;
+use thiserror::Error;
 
 use dzi_file::DziFile;
 
+use crate::ZoomError;
 use crate::dezoomer::*;
 use crate::json_utils::all_json;
 use regex::Regex;
@@ -37,15 +38,22 @@ impl Dezoomer for DziDezoomer {
     }
 }
 
-custom_error! {pub DziError
-    XmlError{source: serde_xml_rs::Error} = "Unable to parse the dzi file: {source}",
-    NoSize = "Expected a size in the DZI file",
-    InvalidTileSize = "Invalid tile size. The tile size cannot be zero.",
+#[derive(Error, Debug)]
+pub enum DziError {
+    #[error("Unable to parse the dzi file: {source}")]
+    XmlError {
+        #[from]
+        source: serde_xml_rs::Error,
+    },
+    #[error("Expected a size in the DZI file")]
+    NoSize,
+    #[error("Invalid tile size. The tile size cannot be zero.")]
+    InvalidTileSize,
 }
 
 impl From<DziError> for DezoomerError {
     fn from(err: DziError) -> Self {
-        DezoomerError::Other { source: err.into() }
+        DezoomerError::wrap(err)
     }
 }
 
@@ -115,26 +123,26 @@ impl TilesRect for DziLevel {
         self.tile_size
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
-        format!(
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
+        Ok(format!(
             "{base}/{level}/{x}_{y}.{format}",
             base = self.base_url,
             level = self.level,
             x = pos.x,
             y = pos.y,
             format = self.format
-        )
+        ))
     }
 
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
         let delta = Vec2d {
             x: if pos.x == 0 { 0 } else { self.overlap },
             y: if pos.y == 0 { 0 } else { self.overlap },
         };
-        TileReference {
-            url: self.tile_url(pos),
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos - delta,
-        }
+        })
     }
 
     fn title(&self) -> Option<String> {
@@ -169,7 +177,12 @@ fn test_panorama() {
     let mut props = load_from_properties(url, contents).unwrap();
     assert_eq!(props.len(), 11);
     let level = &mut props[1];
-    let tiles: Vec<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+    let tiles: Vec<String> = level
+        .next_tiles(None)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.url)
+        .collect();
     assert_eq!(
         tiles,
         vec![
@@ -216,7 +229,12 @@ fn test_openseadragon_javascript() {
     let level =
         &mut load_from_properties("http://test.com/x/test.xml", contents.as_ref()).unwrap()[0];
     assert_eq!(Some(Vec2d { y: 9221, x: 7026 }), level.size_hint());
-    let tiles: Vec<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+    let tiles: Vec<String> = level
+        .next_tiles(None)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.url)
+        .collect();
     assert_eq!(
         tiles[0],
         "http://test.com/example-images/highsmith/highsmith_files/14/0_0.jpg"

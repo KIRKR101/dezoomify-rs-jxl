@@ -3,11 +3,12 @@ use std::fmt::{Debug, Formatter};
 use std::iter::successors;
 use std::sync::Arc;
 
-use custom_error::custom_error;
 use regex::Regex;
 use serde::Deserialize;
+use thiserror::Error;
 
 use crate::Vec2d;
+use crate::ZoomError;
 use crate::dezoomer::{
     Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, IntoZoomLevels,
     TileReference, TilesRect, ZoomLevels,
@@ -117,26 +118,26 @@ impl TilesRect for Level {
         Vec2d::square(self.metadata.tile_size)
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
-        format!(
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
+        Ok(format!(
             "https://access.nypl.org/image.php/{id}/tiles/0/{level}/{x}_{y}.{format}",
             id = self.base,
             level = self.level,
             x = x,
             y = y,
             format = self.metadata.format,
-        )
+        ))
     }
 
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
         let delta = Vec2d {
             x: if pos.x == 0 { 0 } else { self.metadata.overlap },
             y: if pos.y == 0 { 0 } else { self.metadata.overlap },
         };
-        TileReference {
-            url: self.tile_url(pos),
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos - delta,
-        }
+        })
     }
 }
 
@@ -179,15 +180,31 @@ struct MetadataSize {
     height: u32,
 }
 
-custom_error! {pub NYPLError
-    JsonError{resp: String} = "Failed to parse NYPL Image meta as json, \
-        got content(blank shows the site has no zoom function for this one):\n {resp}",
-    Utf8{source: std::str::Utf8Error} = "Invalid NYPL metadata file: {source}",
-    NoIdInUrl{url: String} = "Unable to extract an image id from {url:?}",
-    BadMetadata{source: serde_json::Error} = "Invalid nypl metadata: {source}",
-    NoMetadata = "No metadata found. This image is probably not tiled, \
+#[derive(Error, Debug)]
+pub enum NYPLError {
+    #[error(
+        "Failed to parse NYPL Image meta as json, \
+        got content(blank shows the site has no zoom function for this one):\n {resp}"
+    )]
+    JsonError { resp: String },
+    #[error("Invalid NYPL metadata file: {source}")]
+    Utf8 {
+        #[from]
+        source: std::str::Utf8Error,
+    },
+    #[error("Unable to extract an image id from {url:?}")]
+    NoIdInUrl { url: String },
+    #[error("Invalid nypl metadata: {source}")]
+    BadMetadata {
+        #[from]
+        source: serde_json::Error,
+    },
+    #[error(
+        "No metadata found. This image is probably not tiled, \
     and you can download it directly by right-clicking on it from \
-    your browser without any external tool.",
+    your browser without any external tool."
+    )]
+    NoMetadata,
 }
 
 #[cfg(test)]
@@ -256,7 +273,7 @@ mod tests {
         let expected_url = "https://access.nypl.org/image.php/\
             a28d6e6b-b317-f008-e040-e00a1806635d\
             /tiles/0/12/0_0.png";
-        assert_eq!(level.tile_url(Vec2d { x: 0, y: 0 }), expected_url);
+        assert_eq!(level.tile_url(Vec2d { x: 0, y: 0 }).unwrap(), expected_url);
         assert_eq!(
             parse_image_id(
                 "https://digitalcollections.nypl.org/items/a14f3200-fac1-012f-f7a4-58d385a7bbd0#item-data"
