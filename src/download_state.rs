@@ -211,12 +211,29 @@ impl<'a> TileDownloadCoordinator<'a> {
                 });
             }
         };
-        let permit = self
-            .decode_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("decode semaphore should never be closed");
+
+        // Acquire the decode permit *after* the bytes are in hand. Acquiring
+        // before the download would bound network concurrency, but the
+        // throttler above already serves that role; this semaphore exists
+        // specifically to cap CPU-bound decoding, so we only want to hold
+        // the permit while we are actually decoding.
+        //
+        // We still need to honor cancellation here: a cancel that arrives
+        // between the download resolving and the permit being granted must
+        // short-circuit the decode work, otherwise the spawned blocking
+        // task will run to completion even though the user has asked to
+        // stop.
+        let permit = tokio::select! {
+            permit = self.decode_semaphore.clone().acquire_owned() => {
+                permit.expect("decode semaphore should never be closed")
+            }
+            _ = self.cancel.cancelled() => {
+                return Err(errors::TileDownloadError {
+                    tile_reference: tile_ref_for_error,
+                    cause: ZoomError::Cancelled,
+                });
+            }
+        };
         let decode_result = tokio::task::spawn_blocking(move || {
             let result = decode_tile_bytes(tile_ref, bytes);
             drop(permit);

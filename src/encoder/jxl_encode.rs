@@ -20,6 +20,12 @@ fn check(status: JxlEncoderStatus) -> Result<(), String> {
         JxlEncoderStatus::Success => Ok(()),
         JxlEncoderStatus::Error => Err("JxlEncoder error".into()),
         JxlEncoderStatus::NeedMoreOutput => Ok(()),
+        // libjxl's `JxlEncoderStatus` is a C enum without `#[non_exhaustive]`,
+        // so adding a wildcard here would be `unreachable_patterns`. If a
+        // future libjxl release adds new variants, this match will fail to
+        // compile, which is the right place to handle them. The
+        // `check_handles_all_status_variants` test below guards against
+        // silently dropping a new variant.
     }
 }
 
@@ -243,5 +249,30 @@ impl Drop for JxlEncoder {
         // complete is required by the libjxl API.
         unsafe { JxlResizableParallelRunnerDestroy(self.runner) };
         unsafe { JxlEncoderDestroy(self.enc) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check;
+    use jpegxl_sys::encoder::encode::JxlEncoderStatus;
+
+    /// Exhaustiveness regression test: if a future jpegxl-sys release adds a
+    /// new `JxlEncoderStatus` variant, this test will fail to compile because
+    /// the match in `check` will no longer be exhaustive.
+    #[test]
+    fn check_handles_all_status_variants() {
+        let known = [
+            JxlEncoderStatus::Success,
+            JxlEncoderStatus::Error,
+            JxlEncoderStatus::NeedMoreOutput,
+        ];
+        for status in known {
+            let result = check(status);
+            match status {
+                JxlEncoderStatus::Error => assert!(result.is_err()),
+                _ => assert!(result.is_ok()),
+            }
+        }
     }
 }

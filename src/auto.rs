@@ -5,13 +5,28 @@ use crate::dezoomer::{
 };
 use crate::errors::DezoomerError::NeedsData;
 
+/// Case-insensitive substring search that avoids allocating a lowercased copy
+/// of the haystack. Patterns are typically ASCII so `eq_ignore_ascii_case`
+/// suffices; non-ASCII bytes fall back to exact equality.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Reorder dezoomers to prioritize those most likely to handle the given URL
 pub fn prioritize_dezoomers_for_url(
     url: &str,
     mut dezoomers: Vec<Box<dyn Dezoomer>>,
 ) -> Vec<Box<dyn Dezoomer>> {
     // Define URL patterns and their preferred dezoomers (matched case-insensitively)
-    let lower_url = url.to_lowercase();
     let patterns = [
         ("info.json", "iiif"),
         ("iiif", "iiif"),
@@ -26,6 +41,10 @@ pub fn prioritize_dezoomers_for_url(
         ("artsandculture.google.com", "google_arts_and_culture"),
         ("tiles.yaml", "custom"),
         ("tiles.yml", "custom"),
+        // PFF URLs typically end in `.pff` and use `RequestType=...` query
+        // parameters. Requiring both keeps `requesttype=` from being
+        // triggered by unrelated servlet APIs that also use that query
+        // parameter name (IIPImage, custom DeepZoom, generic JSON, etc.).
         (".pff", "pff"),
         ("requesttype=", "pff"),
         ("{{", "generic"),
@@ -34,10 +53,17 @@ pub fn prioritize_dezoomers_for_url(
     // Find the best matching dezoomer
     let preferred_dezoomer = patterns
         .iter()
-        .find(|(pattern, _)| lower_url.contains(pattern))
+        .find(|(pattern, _)| contains_ignore_ascii_case(url, pattern))
         .map(|(_, dezoomer)| *dezoomer);
 
     if let Some(preferred_name) = preferred_dezoomer {
+        // For `requesttype=`, also confirm a PFF-specific marker is present
+        // before we actually trust the heuristic. This guards against the
+        // pattern being too broad (see comment above).
+        if preferred_name == "pff" && !contains_pff_marker(url) {
+            return dezoomers;
+        }
+
         debug!(
             "URL '{}' appears to match '{}' dezoomer, prioritizing it",
             url, preferred_name
@@ -52,6 +78,12 @@ pub fn prioritize_dezoomers_for_url(
     }
 
     dezoomers
+}
+
+fn contains_pff_marker(url: &str) -> bool {
+    contains_ignore_ascii_case(url, ".pff")
+        || contains_ignore_ascii_case(url, "/pff")
+        || contains_ignore_ascii_case(url, "pff/")
 }
 
 pub fn all_dezoomers(include_generic: bool) -> Vec<Box<dyn Dezoomer>> {
@@ -308,5 +340,35 @@ mod tests {
         let prioritized = prioritize_dezoomers_for_url(zoomify_upper, dezoomers);
         // Matching is now case-insensitive, so uppercase ImageProperties.xml matches zoomify.
         assert_eq!(prioritized[0].name(), "zoomify");
+    }
+
+    #[test]
+    fn test_prioritize_dezoomers_requesttype_requires_pff_marker() {
+        // `requesttype=` alone is too broad: many non-PFF APIs use that
+        // parameter name. We only promote the PFF dezoomer when the URL
+        // also contains a PFF-specific marker.
+
+        // Generic servlet with `requesttype=` but no PFF marker: should NOT
+        // promote PFF.
+        let generic = "https://example.com/api?RequestType=tile&x=0&y=0";
+        let dezoomers = all_dezoomers(false);
+        let original_first = dezoomers[0].name();
+        let prioritized = prioritize_dezoomers_for_url(generic, dezoomers);
+        assert_ne!(prioritized[0].name(), "pff");
+        assert_eq!(prioritized[0].name(), original_first);
+
+        // A PFF URL: `.pff` extension triggers the earlier, more specific
+        // rule and PFF is promoted.
+        let pff = "https://example.com/tiles.pff?RequestType=Tile&TileRow=0";
+        let dezoomers = all_dezoomers(false);
+        let prioritized = prioritize_dezoomers_for_url(pff, dezoomers);
+        assert_eq!(prioritized[0].name(), "pff");
+
+        // A PFF-like URL with `pff` in the path but no extension: still
+        // promoted thanks to the additional marker checks.
+        let pff_path = "https://example.com/pff/svc?requesttype=Tile";
+        let dezoomers = all_dezoomers(false);
+        let prioritized = prioritize_dezoomers_for_url(pff_path, dezoomers);
+        assert_eq!(prioritized[0].name(), "pff");
     }
 }

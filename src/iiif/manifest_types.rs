@@ -275,6 +275,7 @@ impl Manifest {
         let mut infos = Vec::new();
         let manifest_label = self.label.get_english_or_first();
         let metadata_title = self.get_metadata_title();
+        let mut skipped_non_painting = 0usize;
 
         for (canvas_index, canvas) in self.items.iter().enumerate() {
             // We expect "Canvas" type, but proceed even if it's different,
@@ -299,6 +300,7 @@ impl Manifest {
                         .as_deref()
                         .is_none_or(|m| m == "painting");
                     if !is_painting {
+                        skipped_non_painting += 1;
                         debug!(
                             "Skipping annotation with non-painting motivation: {:?}",
                             annotation.motivation
@@ -333,6 +335,14 @@ impl Manifest {
                     }
                 }
             }
+        }
+        if skipped_non_painting > 0 {
+            log::warn!(
+                "IIIF manifest {}: skipped {} annotation(s) with non-painting motivation; \
+                 only painting-annotated canvases are exported",
+                manifest_url,
+                skipped_non_painting,
+            );
         }
         infos
     }

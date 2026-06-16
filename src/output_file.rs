@@ -9,9 +9,47 @@ use crate::{Vec2d, ZoomError};
 
 const MAX_INDEXED_SUFFIXES: u32 = 10_000;
 
+/// Suffix appended to reservation markers. The marker sits *next to* the
+/// intended destination rather than *at* the destination, so a process
+/// crash between reservation and encoding leaves a clearly-named `.tmp`
+/// file alongside the (untouched) target rather than a 0-byte file at
+/// the target path.
+const RESERVATION_SUFFIX: &str = ".tmp";
+
 pub(crate) fn reserve_output_file(path: &Path) -> Result<(), ZoomError> {
-    OpenOptions::new().write(true).create_new(true).open(path)?;
+    let marker = reservation_marker(path);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)?;
     Ok(())
+}
+
+/// Return the path of the reservation marker used to claim `path`. The
+/// marker is a sibling file with a `.tmp` suffix.
+pub(crate) fn reservation_marker(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    name.push(RESERVATION_SUFFIX);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Remove the reservation marker for `path`, if it exists. Best-effort: any
+/// error (e.g. file already removed by a previous cleanup) is swallowed so
+/// that callers can use this in `Drop` and on success/failure paths
+/// without having to thread a `Result` through.
+pub(crate) fn release_reservation(path: &Path) {
+    let marker = reservation_marker(path);
+    if let Err(e) = std::fs::remove_file(&marker)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!(
+            "Failed to remove reservation marker {}: {e}",
+            marker.display()
+        );
+    }
 }
 
 /// Try to reserve a candidate output path. On `AlreadyExists`, append the next
@@ -128,15 +166,22 @@ mod tests {
         let zoom_name = Some("collision".to_string());
         let size = Some(Vec2d { x: 100, y: 100 });
 
-        // First call reserves the base name.
+        // First call reserves the base name. The reservation marker is a
+        // sibling `.tmp` file; the destination path itself is left untouched
+        // so that a crash between reservation and encoding does not leave a
+        // 0-byte file at the requested output name.
         let first = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
         assert_eq!(first.file_name().unwrap(), "collision.jxl");
-        assert!(first.exists());
+        assert!(
+            !first.exists(),
+            "destination must not be created during reservation"
+        );
+        assert!(reservation_marker(&first).exists());
 
         // Second call with the same title must pick a suffix.
         let second = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
         assert_eq!(second.file_name().unwrap(), "collision_0001.jxl");
-        assert!(second.exists());
+        assert!(reservation_marker(&second).exists());
     }
 
     #[test]
@@ -152,9 +197,9 @@ mod tests {
 
         // Reserve the base name first.
         let _ = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
-        // Then pre-create all suffixed variants up to the limit.
+        // Then pre-create all suffixed marker variants up to the limit.
         for i in 1..=MAX_INDEXED_SUFFIXES {
-            let name = format!("flood_{i:04}.jxl");
+            let name = format!("flood_{i:04}.jxl.tmp");
             File::create(base_dir.as_ref().join(&name)).expect("pre-create collision");
         }
 

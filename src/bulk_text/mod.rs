@@ -88,12 +88,14 @@ fn validate_url_or_path(input: &str, line_number: usize) -> Result<(), BulkTextE
 /// Parse a text file content and extract URLs
 /// Each non-empty, non-comment line should start with a valid URL.
 /// An optional custom title can follow the URL. Titles may be quoted with " or '.
-/// Inline comments are supported after the title using ` # `.
+/// Inline comments are supported after the title using ` #` (a space followed
+/// by a hash; no trailing space is required). A hash that is not preceded by
+/// a space is part of the title.
 /// Formats:
 ///   URL
 ///   URL My title
 ///   URL "My title"
-///   URL 'My title' # inline comment
+///   URL 'My title' #inline comment
 fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError> {
     let mut urls = Vec::new();
 
@@ -125,7 +127,7 @@ fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError
 }
 
 /// Split a bulk-text line into a URL and an optional title.
-/// Supports quoted titles and ` # ` inline comments.
+/// Supports quoted titles and ` #` inline comments.
 fn split_url_and_title(line: &str) -> (&str, Option<&str>) {
     // Extract the URL as the first whitespace-delimited token.
     let mut chars = line.char_indices();
@@ -377,11 +379,22 @@ http://example.com/3.jpg Plain title # comment
 
     #[test]
     fn test_split_url_and_title_comment_requires_space() {
-        // The inline-comment syntax is ` # ` (space, hash, space). A hash
-        // attached directly to the title is treated as part of the title.
+        // The inline-comment syntax is ` #` (a space followed by a hash).
+        // A hash that is *not* preceded by a space is part of the title.
         let (url, title) = split_url_and_title("http://x.jpg My title#comment");
         assert_eq!(url, "http://x.jpg");
         assert_eq!(title, Some("My title#comment"));
+    }
+
+    #[test]
+    fn test_split_url_and_title_comment_no_trailing_space() {
+        // No trailing space is required after the hash: a title like
+        // `My title #1` is split into the title `My title` and the comment
+        // `#1`. (The leading space is what disambiguates the comment from a
+        // literal `#` in the title.)
+        let (url, title) = split_url_and_title("http://x.jpg My title #1");
+        assert_eq!(url, "http://x.jpg");
+        assert_eq!(title, Some("My title"));
     }
 
     #[test]

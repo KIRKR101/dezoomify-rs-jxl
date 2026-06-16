@@ -44,7 +44,8 @@ pub struct Arguments {
     max_width: Option<u32>,
 
     /// If several zoom levels are available, select the one with the largest height that
-    /// does not exceed this value (in pixels)
+    /// does not exceed this value (in pixels). If only one of `--max-width`/`--max-height`
+    /// is given, the other dimension is not constrained.
     #[arg(short = 'h', long = "max-height")]
     max_height: Option<u32>,
 

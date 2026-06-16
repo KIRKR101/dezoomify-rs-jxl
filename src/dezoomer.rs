@@ -211,6 +211,10 @@ impl TileProvider for TitledZoomLevel {
     fn http_headers(&self) -> HashMap<String, String> {
         self.inner.http_headers()
     }
+
+    fn expects_failed_tiles(&self) -> bool {
+        self.inner.expects_failed_tiles()
+    }
 }
 
 fn zoom_levels_with_title(levels: ZoomLevels, title: Option<String>) -> ZoomLevels {

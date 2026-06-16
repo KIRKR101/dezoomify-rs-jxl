@@ -291,11 +291,35 @@ pub async fn dezoomify_with_cancel(
         &base_dir,
         zoom_level.size_hint(),
     )?;
+    // The reservation marker is a `.tmp` sibling that was created next to
+    // `save_as` by `prepare_output_path` to atomically claim the output
+    // path. We want it cleaned up on both success and failure; on
+    // cancellation the cleanup happens here as well.
+    let _guard = ReservationGuard::new(save_as.clone());
     let tile_buffer =
         create_tile_buffer(save_as.clone(), args.compression, args.jxl_effort).await?;
     info!("Dezooming {}", zoom_level.name());
     dezoomify_level(args, zoom_level, tile_buffer, cancel, None).await?;
     Ok(save_as)
+}
+
+/// RAII helper that removes the reservation marker for a given output path
+/// when dropped. Keeps cleanup out of the success/failure paths in
+/// `dezoomify_with_cancel` and the bulk driver.
+struct ReservationGuard {
+    path: std::path::PathBuf,
+}
+
+impl ReservationGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        crate::output_file::release_reservation(&self.path);
+    }
 }
 
 /// Statistics for bulk processing
@@ -596,24 +620,17 @@ async fn process_single_bulk_image(
 
     // Compute and atomically reserve the output path. For derived titles this
     // loops on _0001-style suffixes until it successfully creates the file.
-    let save_as = match if let Some(base_outfile) = bulk_outfile {
-        // In bulk mode with specified outfile, use index-based naming with collision handling
-        let base_path = generate_bulk_output_name(base_outfile, index);
-        reserve_unique_outname(
-            &Some(base_path),
-            &zoom_level.title().or_else(|| Some(image_title.clone())),
-            base_dir,
-            zoom_level.size_hint(),
-        )
-    } else {
-        // Use the zoom level title if present, fallback to image title
-        reserve_unique_outname(
-            &None,
-            &zoom_level.title().or_else(|| Some(image_title.clone())),
-            base_dir,
-            zoom_level.size_hint(),
-        )
-    } {
+    // In bulk mode with a specified outfile, we first generate an index-based
+    // base path; otherwise we let `reserve_unique_outname` derive the name
+    // from the zoom level title (falling back to the image title).
+    let base_outfile = bulk_outfile.map(|p| generate_bulk_output_name(p, index));
+    let title_hint = zoom_level.title().or_else(|| Some(image_title.clone()));
+    let save_as = match reserve_unique_outname(
+        &base_outfile,
+        &title_hint,
+        base_dir,
+        zoom_level.size_hint(),
+    ) {
         Ok(path) => path,
         Err(e) => {
             return Ok(SingleBulkOutcome {
@@ -624,6 +641,7 @@ async fn process_single_bulk_image(
             });
         }
     };
+    let _reservation_guard = ReservationGuard::new(save_as.clone());
 
     let tile_buffer =
         match create_tile_buffer(save_as.clone(), args.compression, args.jxl_effort).await {
