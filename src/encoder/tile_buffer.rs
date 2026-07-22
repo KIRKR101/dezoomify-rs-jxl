@@ -6,8 +6,8 @@ Used to receive tiles asynchronously and provide them to the encoder
 use log::debug;
 use tokio::sync::mpsc;
 
-use crate::encoder::{Encoder, encoder_for_name};
-use crate::tile::Tile;
+use crate::encoder::{Encoder, SourceLevel, encoder_for_name};
+use crate::tile::{EncodedTile, Tile};
 use crate::{Vec2d, ZoomError};
 use log::warn;
 
@@ -16,40 +16,41 @@ pub enum TileBuffer {
     Buffering {
         destination: PathBuf,
         buffer: Vec<Tile>,
+        encoded_buffer: Vec<EncodedTile>,
         compression: u8,
         jxl_effort: Option<u8>,
+        prefer_encoded_tiles: bool,
     },
     Writing {
         destination: PathBuf,
         tile_sender: mpsc::Sender<TileBufferMsg>,
-        error_receiver: mpsc::Receiver<std::io::Error>,
+        error_receiver: mpsc::UnboundedReceiver<std::io::Error>,
+        prefer_encoded_tiles: bool,
     },
 }
 
 impl TileBuffer {
-    /// Create an encoder for an image of the given size at the path
-    /// Errors out if the encoder cannot create files with the given extension
-    /// or at the given size
-    pub async fn new(
-        destination: PathBuf,
-        compression: u8,
-        jxl_effort: Option<u8>,
-    ) -> Result<Self, ZoomError> {
-        Ok(TileBuffer::Buffering {
+    /// Create a tile buffer for an output path.
+    pub fn new(destination: PathBuf, compression: u8, jxl_effort: Option<u8>) -> Self {
+        TileBuffer::Buffering {
             destination,
             buffer: vec![],
+            encoded_buffer: vec![],
             compression,
             jxl_effort,
-        })
+            prefer_encoded_tiles: false,
+        }
     }
 
-    pub async fn set_size(&mut self, size: Vec2d) -> Result<(), ZoomError> {
+    pub fn set_size(&mut self, size: Vec2d) -> Result<(), ZoomError> {
         let next_state = match self {
             TileBuffer::Buffering {
                 buffer,
+                encoded_buffer,
                 destination,
                 compression,
                 jxl_effort,
+                prefer_encoded_tiles,
             } => {
                 let destination = std::mem::take(destination);
                 let jxl_effort = *jxl_effort;
@@ -60,7 +61,10 @@ impl TileBuffer {
                 for tile in buffer.drain(..) {
                     encoder.add_tile(tile)?;
                 }
-                buffer_tiles(encoder, destination).await
+                for tile in encoded_buffer.drain(..) {
+                    encoder.add_encoded_tile(tile)?;
+                }
+                buffer_tiles(encoder, destination, *prefer_encoded_tiles)
             }
             TileBuffer::Writing { .. } => {
                 unreachable!("The size of the image can be set only once")
@@ -68,6 +72,55 @@ impl TileBuffer {
         };
         *self = next_state;
         Ok(())
+    }
+
+    pub fn has_size(&self) -> bool {
+        matches!(self, TileBuffer::Writing { .. })
+    }
+
+    pub fn prefers_encoded_tiles(&self) -> bool {
+        match self {
+            TileBuffer::Buffering {
+                prefer_encoded_tiles,
+                ..
+            }
+            | TileBuffer::Writing {
+                prefer_encoded_tiles,
+                ..
+            } => *prefer_encoded_tiles,
+        }
+    }
+
+    /// Start writing a source pyramid level.
+    pub async fn begin_level(&mut self, level: SourceLevel) -> Result<(), ZoomError> {
+        let prefer_encoded_tiles = {
+            let extension = self.destination().extension().unwrap_or_default();
+            extension == "tiff" || extension == "tif" || extension == "zif"
+        };
+        match self {
+            TileBuffer::Buffering {
+                prefer_encoded_tiles: current_preference,
+                ..
+            } => {
+                *current_preference = prefer_encoded_tiles;
+                self.set_size(level.size)?;
+                if let TileBuffer::Writing { tile_sender, .. } = self {
+                    tile_sender.send(TileBufferMsg::BeginLevel(level)).await?;
+                    Ok(())
+                } else {
+                    unreachable!("set_size transitions buffering to writing")
+                }
+            }
+            TileBuffer::Writing {
+                tile_sender,
+                prefer_encoded_tiles: current_preference,
+                ..
+            } => {
+                *current_preference = prefer_encoded_tiles;
+                tile_sender.send(TileBufferMsg::BeginLevel(level)).await?;
+                Ok(())
+            }
+        }
     }
 
     /// Add a tile to the image
@@ -83,14 +136,37 @@ impl TileBuffer {
         }
     }
 
+    /// Add an encoded tile to the image without decoding it.
+    pub async fn add_encoded_tile(&mut self, tile: EncodedTile) {
+        match self {
+            TileBuffer::Buffering { encoded_buffer, .. } => encoded_buffer.push(tile),
+            TileBuffer::Writing { tile_sender, .. } => {
+                tile_sender
+                    .send(TileBufferMsg::AddEncodedTile(tile))
+                    .await
+                    .expect("The tile writer ended unexpectedly");
+            }
+        }
+    }
+
     /// To be called when no more tile will be added
     pub async fn finalize(&mut self) -> Result<(), ZoomError> {
-        if let TileBuffer::Buffering { buffer, .. } = self {
-            let size = buffer
+        if let TileBuffer::Buffering {
+            buffer,
+            encoded_buffer,
+            ..
+        } = self
+        {
+            let decoded_size = buffer
                 .iter()
                 .map(|t| t.position + t.size())
                 .fold(Vec2d { x: 0, y: 0 }, Vec2d::max);
-            self.set_size(size).await?;
+            let encoded_size = encoded_buffer
+                .iter()
+                .map(|t| t.position + t.size)
+                .fold(Vec2d { x: 0, y: 0 }, Vec2d::max);
+            let size = decoded_size.max(encoded_size);
+            self.set_size(size)?;
         }
         let (tile_sender, error_receiver) = match self {
             TileBuffer::Buffering { .. } => unreachable!("Just set the size"),
@@ -105,37 +181,60 @@ impl TileBuffer {
         let mut result = Ok(());
         // Wait for the encoder to terminate even if some tiles raised errors
         while let Some(err) = error_receiver.recv().await {
-            result = Err(err.into())
+            result = Err(err.into());
         }
         result
     }
 
     pub fn destination(&self) -> &PathBuf {
         match self {
-            TileBuffer::Buffering { destination, .. } => destination,
-            TileBuffer::Writing { destination, .. } => destination,
+            TileBuffer::Buffering { destination, .. } | TileBuffer::Writing { destination, .. } => {
+                destination
+            }
         }
     }
 }
 
 #[derive(Debug)]
 pub enum TileBufferMsg {
+    BeginLevel(SourceLevel),
     AddTile(Tile),
+    AddEncodedTile(EncodedTile),
     Close,
 }
 
-async fn buffer_tiles(mut encoder: Box<dyn Encoder>, destination: PathBuf) -> TileBuffer {
+fn buffer_tiles(
+    mut encoder: Box<dyn Encoder>,
+    destination: PathBuf,
+    prefer_encoded_tiles: bool,
+) -> TileBuffer {
     let (tile_sender, mut tile_receiver) = mpsc::channel(1024);
-    let (error_sender, error_receiver) = mpsc::channel(1);
+    let (error_sender, error_receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(msg) = tile_receiver.recv().await {
             match msg {
+                TileBufferMsg::BeginLevel(level) => {
+                    debug!("Starting output source level: {level:?}");
+                    let result = tokio::task::block_in_place(|| encoder.begin_level(level));
+                    if let Err(err) = result {
+                        warn!("Error when starting output source level: {err}");
+                        error_sender.send(err).expect("could not send error");
+                    }
+                }
                 TileBufferMsg::AddTile(tile) => {
                     debug!("Sending tile to encoder: {tile:?}");
                     let result = tokio::task::block_in_place(|| encoder.add_tile(tile));
                     if let Err(err) = result {
                         warn!("Error when adding tile: {err}");
-                        error_sender.send(err).await.expect("could not send error");
+                        error_sender.send(err).expect("could not send error");
+                    }
+                }
+                TileBufferMsg::AddEncodedTile(tile) => {
+                    debug!("Sending encoded tile to encoder: {tile:?}");
+                    let result = tokio::task::block_in_place(|| encoder.add_encoded_tile(tile));
+                    if let Err(err) = result {
+                        warn!("Error when adding encoded tile: {err}");
+                        error_sender.send(err).expect("could not send error");
                     }
                 }
                 TileBufferMsg::Close => {
@@ -146,12 +245,13 @@ async fn buffer_tiles(mut encoder: Box<dyn Encoder>, destination: PathBuf) -> Ti
         debug!("Finalizing the encoder");
         if let Err(err) = encoder.finalize() {
             warn!("Error when finalizing image: {err}");
-            error_sender.send(err).await.expect("could not send error");
+            error_sender.send(err).expect("could not send error");
         }
     });
     TileBuffer::Writing {
         tile_sender,
         error_receiver,
         destination,
+        prefer_encoded_tiles,
     }
 }

@@ -604,6 +604,20 @@ async fn test_google_arts_and_culture_dezoomer_basic() {
     use dezoomify_rs::google_arts_and_culture::GAPDezoomer;
     use std::fs;
 
+    fn expect_single_resolved(
+        images: dezoomify_rs::dezoomer::Images,
+    ) -> dezoomify_rs::dezoomer::ResolvedImage {
+        assert_eq!(
+            images.len(),
+            1,
+            "expected exactly one resolved image, got {images:#?}"
+        );
+        match images.into_iter().next().unwrap() {
+            dezoomify_rs::dezoomer::ZoomableImage::Resolved(image) => image,
+            other => panic!("expected a resolved image, got {other:?}"),
+        }
+    }
+
     let workspace_root = get_workspace_root();
     let test_html_path = workspace_root.join("testdata/google_arts_and_culture/page_source.html");
     let test_xml_path = workspace_root.join("testdata/google_arts_and_culture/tile_info.xml");
@@ -621,7 +635,7 @@ async fn test_google_arts_and_culture_dezoomer_basic() {
         contents: PageContents::Success(page_html),
     };
 
-    let result1 = dezoomer.zoom_levels(&input1);
+    let result1 = dezoomer.images(&input1);
     let tile_info_uri = match result1 {
         Err(DezoomerError::NeedsData { uri }) => {
             assert!(uri.ends_with("=g"));
@@ -637,10 +651,12 @@ async fn test_google_arts_and_culture_dezoomer_basic() {
         contents: PageContents::Success(tile_info_xml),
     };
 
-    let result2 = dezoomer.zoom_levels(&input2);
+    let result2 = dezoomer.images(&input2);
     match result2 {
-        Ok(levels) => {
-            assert!(!levels.is_empty(), "Should have at least one zoom level");
+        Ok(images) => {
+            let image = expect_single_resolved(images);
+            let levels = image.into_zoom_levels();
+            assert_eq!(levels.len(), 5);
             println!("Successfully parsed {} zoom levels", levels.len());
         }
         Err(e) => panic!("Failed to parse tile info: {:?}", e),
@@ -660,7 +676,7 @@ async fn test_google_arts_and_culture_url_validation() {
         contents: PageContents::Success(b"invalid html".to_vec()),
     };
 
-    let result = dezoomer.zoom_levels(&valid_input);
+    let result = dezoomer.images(&valid_input);
     // Should not be rejected as wrong dezoomer
     assert!(!matches!(result, Err(DezoomerError::WrongDezoomer { .. })));
 
@@ -671,6 +687,6 @@ async fn test_google_arts_and_culture_url_validation() {
         contents: PageContents::Success(vec![]),
     };
 
-    let result = dezoomer2.zoom_levels(&invalid_input);
+    let result = dezoomer2.images(&invalid_input);
     assert!(matches!(result, Err(DezoomerError::WrongDezoomer { .. })));
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::iter::once;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,6 @@ use crate::binary_display::display_bytes;
 use crate::dezoomer::{PostProcessFn, TileReference};
 use crate::errors::BufferToImageError;
 use crate::errors::{TileDownloadError, ZoomError};
-use crate::tile::{Tile, load_image_with_metadata};
 
 /// Fetch data, either from an URL or a path to a local file.
 /// If uri doesnt start with "http(s)://", it is considered to be a path
@@ -56,6 +56,12 @@ pub async fn fetch_uri(uri: &str, http: &Client) -> Result<Vec<u8>, ZoomError> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadedTile {
+    pub position: crate::Vec2d,
+    pub bytes: Arc<Vec<u8>>,
+}
+
 pub struct TileDownloader {
     pub http_client: reqwest::Client,
     pub post_process_fn: PostProcessFn,
@@ -65,23 +71,28 @@ pub struct TileDownloader {
 }
 
 impl TileDownloader {
-    pub async fn download_tile(
+    pub async fn download_tile_and_then<T, F, Fut>(
         &self,
         tile_reference: TileReference,
-    ) -> Result<Tile, TileDownloadError> {
-        // The initial delay after which a failed request is retried depends on the position of the tile
-        // in order to avoid sending repeated "bursts" of requests to a server that is struggling
+        mut process: F,
+    ) -> Result<T, TileDownloadError>
+    where
+        F: FnMut(DownloadedTile) -> Fut,
+        Fut: Future<Output = Result<T, ZoomError>>,
+    {
         let n = 100;
         let idx: f64 = ((tile_reference.position.x + tile_reference.position.y) % n).into();
         let tile_reference = Arc::new(tile_reference);
         let mut wait_time = self.retry_delay
-            + Duration::from_secs_f64(idx * self.retry_delay.as_secs_f64() / n as f64);
+            + Duration::from_secs_f64(idx * self.retry_delay.as_secs_f64() / f64::from(n));
         let mut failures: usize = 0;
         loop {
-            match self.load_image(Arc::clone(&tile_reference)).await {
-                Ok(tile) => {
-                    return Ok(tile);
-                }
+            let result = match self.load_tile_bytes(Arc::clone(&tile_reference)).await {
+                Ok(tile) => process(tile).await,
+                Err(cause) => Err(cause),
+            };
+            match result {
+                Ok(processed) => return Ok(processed),
                 Err(cause) => {
                     if failures >= self.retries {
                         return Err(TileDownloadError {
@@ -99,7 +110,10 @@ impl TileDownloader {
         }
     }
 
-    async fn load_image(&self, tile_reference: Arc<TileReference>) -> Result<Tile, ZoomError> {
+    async fn load_tile_bytes(
+        &self,
+        tile_reference: Arc<TileReference>,
+    ) -> Result<DownloadedTile, ZoomError> {
         let bytes = if let Some(bytes) = self.read_from_tile_cache(&tile_reference.url).await {
             bytes
         } else {
@@ -110,16 +124,10 @@ impl TileDownloader {
             bytes
         };
 
-        let position = tile_reference.position;
-        let image_with_metadata =
-            tokio::task::spawn_blocking(move || load_image_with_metadata(&bytes)).await??;
-
-        Ok(Tile::builder()
-            .with_image(image_with_metadata.image)
-            .at_position(position)
-            .with_optional_icc_profile(image_with_metadata.icc_profile)
-            .with_optional_exif_metadata(image_with_metadata.exif_metadata)
-            .build())
+        Ok(DownloadedTile {
+            position: tile_reference.position,
+            bytes: Arc::new(bytes),
+        })
     }
 
     async fn download_image_bytes(
@@ -140,8 +148,11 @@ impl TileDownloader {
     async fn write_to_tile_cache(&self, uri: &str, contents: &[u8]) {
         if let Some(root) = &self.tile_storage_folder {
             match tokio::fs::write(root.join(sanitize(uri)), contents).await {
-                Ok(_) => debug!("Wrote {} to tile cache ({} bytes)", uri, contents.len()),
-                Err(e) => warn!("Unable to write {uri} to the tile cache {root:?}: {e}"),
+                Ok(()) => debug!("Wrote {} to tile cache ({} bytes)", uri, contents.len()),
+                Err(e) => warn!(
+                    "Unable to write {uri} to the tile cache {}: {e}",
+                    root.display()
+                ),
             }
         }
     }
@@ -153,7 +164,10 @@ impl TileDownloader {
                     debug!("{uri} read from tile cache");
                     return Some(d);
                 }
-                Err(e) => debug!("Unable to open {uri} from tile cache {root:?}: {e}"),
+                Err(e) => debug!(
+                    "Unable to open {uri} from tile cache {}: {e}",
+                    root.display()
+                ),
             }
         }
         None
@@ -175,6 +189,7 @@ pub fn client<'a, I: Iterator<Item = (&'a String, &'a String)>>(
         .collect::<Result<header::HeaderMap, ZoomError>>()?;
     debug!("Creating an http client with the following headers: {header_map:?}");
     let client = reqwest::Client::builder()
+        .use_native_tls()
         .http1_title_case_headers()
         .default_headers(header_map)
         .referer(false)
@@ -197,21 +212,38 @@ pub fn resolve_relative(base: &str, path: &str) -> String {
     {
         return r.to_string();
     }
-    let mut res = PathBuf::from(base.rsplitn(2, '/').last().unwrap_or_default());
-    res.push(path);
-    res.to_string_lossy().to_string()
+    // Local-path fallback: drop the last component of `base` and append `path`.
+    // Recognize both `/` and `\` so that Windows local paths resolve correctly
+    // (a bare `C:\foo\bar\tour.js` has no `/`, so the old `/`-only split treated
+    // the entire string as the directory and appended instead of replacing).
+    //
+    // Absolute paths (starting with `/` or a Windows drive prefix) replace the
+    // base entirely, matching `PathBuf::push` semantics.
+    if path.starts_with('/')
+        || path.starts_with('\\')
+        || (path.len() >= 2
+            && path.as_bytes()[1] == b':'
+            && path.as_bytes()[0].is_ascii_alphabetic())
+    {
+        return path.to_string();
+    }
+    let dir = base.rfind(['/', '\\']).map_or("", |idx| &base[..idx]);
+    let dir = dir.trim_end_matches(['/', '\\']);
+    if dir.is_empty() {
+        path.to_string()
+    } else {
+        format!("{dir}/{path}")
+    }
 }
 
 #[test]
 fn test_resolve_relative() {
-    use std::path::MAIN_SEPARATOR;
+    assert_eq!(resolve_relative("/a/b", "c/d"), "/a/c/d");
+    // Windows local path: the last component must be replaced, not appended.
+    assert_eq!(resolve_relative("C:\\\\foo\\\\bar", "c/d"), "C:\\\\foo/c/d");
     assert_eq!(
-        resolve_relative("/a/b", "c/d"),
-        format!("/a{}c/d", MAIN_SEPARATOR)
-    );
-    assert_eq!(
-        resolve_relative("C:\\\\X", "c/d"),
-        format!("C:\\\\X{}c/d", MAIN_SEPARATOR)
+        resolve_relative("C:\\\\foo\\\\bar\\\\tour.js", "tour.xml"),
+        "C:\\\\foo\\\\bar/tour.xml"
     );
     assert_eq!(
         resolve_relative("/a/b", "http://example.com/x"),
@@ -224,4 +256,14 @@ fn test_resolve_relative() {
     assert_eq!(resolve_relative("http://a.b", "c/d"), "http://a.b/c/d");
     assert_eq!(resolve_relative("http://a.b/x", "c/d"), "http://a.b/c/d");
     assert_eq!(resolve_relative("http://a.b/x/", "c/d"), "http://a.b/x/c/d");
+    // Absolute local paths replace the base entirely.
+    assert_eq!(
+        resolve_relative("/metadata/tour.xml", "/tiles/0_0.jpg"),
+        "/tiles/0_0.jpg"
+    );
+    // Absolute Windows paths replace the base entirely.
+    assert_eq!(
+        resolve_relative("C:\\metadata\\tour.xml", "C:\\tiles\\0_0.jpg"),
+        "C:\\tiles\\0_0.jpg"
+    );
 }

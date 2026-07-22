@@ -1,9 +1,20 @@
 use std::ffi::c_void;
 
 use jpegxl_sys::common::types::{JxlBool, JxlBoxType, JxlDataType, JxlEndianness, JxlPixelFormat};
-use jpegxl_sys::encoder::encode::*;
+use jpegxl_sys::encoder::encode::{
+    JxlEncoderAddBox, JxlEncoderAddImageFrame, JxlEncoderCloseBoxes, JxlEncoderCloseInput,
+    JxlEncoderCreate, JxlEncoderDestroy, JxlEncoderDistanceFromQuality,
+    JxlEncoderFrameSettingId, JxlEncoderFrameSettingsCreate,
+    JxlEncoderFrameSettingsSetOption, JxlEncoderInitBasicInfo, JxlEncoderProcessOutput,
+    JxlEncoderSetBasicInfo, JxlEncoderSetFrameDistance, JxlEncoderSetFrameLossless,
+    JxlEncoderSetICCProfile, JxlEncoderSetParallelRunner, JxlEncoderStatus, JxlEncoderUseBoxes,
+};
 use jpegxl_sys::metadata::codestream_header::JxlBasicInfo;
-use jpegxl_sys::threads::resizable_parallel_runner::*;
+use jpegxl_sys::threads::resizable_parallel_runner::{
+    JxlResizableParallelRunner, JxlResizableParallelRunnerCreate,
+    JxlResizableParallelRunnerDestroy, JxlResizableParallelRunnerSetThreads,
+    JxlResizableParallelRunnerSuggestThreads,
+};
 
 pub struct JxlEncoder {
     enc: *mut jpegxl_sys::encoder::encode::JxlEncoder,
@@ -16,9 +27,8 @@ unsafe impl Send for JxlEncoder {}
 
 fn check(status: JxlEncoderStatus) -> Result<(), String> {
     match status {
-        JxlEncoderStatus::Success => Ok(()),
+        JxlEncoderStatus::Success | JxlEncoderStatus::NeedMoreOutput => Ok(()),
         JxlEncoderStatus::Error => Err("JxlEncoder error".into()),
-        JxlEncoderStatus::NeedMoreOutput => Ok(()),
     }
 }
 
@@ -59,7 +69,7 @@ impl JxlEncoder {
     ) -> Result<(), String> {
         // SAFETY: runner is a valid handle, num_threads is in range.
         let num_threads =
-            unsafe { JxlResizableParallelRunnerSuggestThreads(width as u64, height as u64) };
+            unsafe { JxlResizableParallelRunnerSuggestThreads(u64::from(width), u64::from(height)) };
         // SAFETY: runner is valid. Setting threads after the runner was already
         // attached to the encoder is supported by libjxl.
         unsafe { JxlResizableParallelRunnerSetThreads(self.runner, num_threads as usize) };
@@ -80,7 +90,7 @@ impl JxlEncoder {
         }
         info.uses_original_profile = JxlBool::from(uses_original_profile);
         // SAFETY: enc and info are valid; info was initialized by InitBasicInfo.
-        let status = unsafe { JxlEncoderSetBasicInfo(self.enc, &info) };
+        let status = unsafe { JxlEncoderSetBasicInfo(self.enc, &raw const info) };
         check(status)
     }
 
@@ -114,7 +124,7 @@ impl JxlEncoder {
         }
 
         // Map effort (1-9) from compression parameter.
-        let effort = effort.clamp(1, 9) as i64;
+        let effort = i64::from(effort.clamp(1, 9));
         // SAFETY: frame_settings is valid, effort is in range [1, 9].
         unsafe {
             JxlEncoderFrameSettingsSetOption(
@@ -168,8 +178,8 @@ impl JxlEncoder {
         let status = unsafe {
             JxlEncoderAddImageFrame(
                 frame_settings,
-                &pixel_format,
-                data.as_ptr() as *const c_void,
+                &raw const pixel_format,
+                data.as_ptr().cast::<c_void>(),
                 data.len(),
             )
         };
@@ -181,17 +191,17 @@ impl JxlEncoder {
             let mut box_contents = vec![0u8; 4];
             box_contents.extend_from_slice(exif_data);
             let box_type = JxlBoxType([
-                b'E' as std::ffi::c_char,
-                b'x' as std::ffi::c_char,
-                b'i' as std::ffi::c_char,
-                b'f' as std::ffi::c_char,
+                b'E'.cast_signed(),
+                b'x'.cast_signed(),
+                b'i'.cast_signed(),
+                b'f'.cast_signed(),
             ]);
             // SAFETY: enc is valid, box_type is a valid 4-byte type,
             // contents pointer and length are valid for the slice lifetime.
             let status = unsafe {
                 JxlEncoderAddBox(
                     self.enc,
-                    &box_type,
+                    &raw const box_type,
                     box_contents.as_ptr(),
                     box_contents.len(),
                     JxlBool::False,
@@ -221,8 +231,9 @@ impl JxlEncoder {
 
             // SAFETY: enc is valid, next_out points to a writable buffer of
             // avail_out bytes. avail_out >= 32 per libjxl requirements.
-            let status =
-                unsafe { JxlEncoderProcessOutput(self.enc, &mut next_out, &mut avail_out) };
+            let status = unsafe {
+                JxlEncoderProcessOutput(self.enc, &raw mut next_out, &raw mut avail_out)
+            };
 
             let written = buf.len() - avail_out;
             output.extend_from_slice(&buf[..written]);
@@ -230,7 +241,9 @@ impl JxlEncoder {
             match status {
                 JxlEncoderStatus::Success => break,
                 JxlEncoderStatus::NeedMoreOutput => {}
-                _ => return Err("JxlEncoderProcessOutput error".into()),
+                JxlEncoderStatus::Error => {
+                    return Err("JxlEncoderProcessOutput error".into());
+                }
             }
         }
         Ok(output)

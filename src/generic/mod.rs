@@ -1,12 +1,12 @@
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use regex::Regex;
 
 use crate::Vec2d;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, TileFetchResult, TileProvider, TileReference,
-    ZoomLevels, single_level,
+    Dezoomer, DezoomerError, DezoomerInput, Images, TileFetchResult, TileProvider, TileReference,
+    single_level,
 };
 
 mod dichotomy_2d;
@@ -22,31 +22,31 @@ impl Dezoomer for GenericDezoomer {
         "generic"
     }
 
-    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
         self.assert(TEMPLATE_RE.is_match(&data.uri))?;
         let dezoomer = ZoomLevel {
             url_template: data.uri.clone(),
-            dichotomy: Default::default(),
+            dichotomy: dichotomy_2d::Dichotomy2d::default(),
             last_tile: (0, 0),
             done: HashSet::new(),
             tile_size: None,
             image_size: None,
         };
-        single_level(dezoomer)
+        Ok(single_level(dezoomer).into())
     }
 }
 
-lazy_static! {
-    static ref TEMPLATE_RE: Regex = Regex::new(
+static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
         r"(?xi)
     \{\{
         (?P<dimension>x|y)
         (?::0(?P<zeroes>\d+))?
      \}\}
-    "
+    ",
     )
-    .unwrap();
-}
+    .unwrap()
+});
 
 struct ZoomLevel {
     url_template: String,
@@ -137,17 +137,17 @@ impl std::fmt::Debug for ZoomLevel {
 #[test]
 fn test_generic_dezoomer() {
     use crate::dezoomer::PageContents;
+    use crate::dezoomer::test_utils::expect_single_resolved;
     use std::collections::HashSet;
     let uri = "{{X}},{{Y}}".to_string();
-    let mut lvl = GenericDezoomer {}
-        .zoom_levels(&DezoomerInput {
+    let images = GenericDezoomer {}
+        .images(&DezoomerInput {
             uri,
             contents: PageContents::Unknown,
         })
-        .unwrap()
-        .into_iter()
-        .next()
         .unwrap();
+    let image = expect_single_resolved(images);
+    let mut lvl = image.into_zoom_levels().into_iter().next().unwrap();
 
     let existing_tiles = ["0,0", "1,0", "2,0", "0,1", "1,1", "2,1"];
 
@@ -208,11 +208,11 @@ fn test_url_templating() {
     let url_template = "http://x.com/{{x:05}}_{{y}}".to_string();
     let lvl: ZoomLevel = ZoomLevel {
         url_template,
-        dichotomy: Default::default(),
+        dichotomy: dichotomy_2d::Dichotomy2d::default(),
         last_tile: (0, 0),
         tile_size: None,
         image_size: None,
-        done: Default::default(),
+        done: HashSet::default(),
     };
     assert_eq!(lvl.tile_url_at(10, 11), "http://x.com/00010_11");
     assert_eq!(lvl.tile_url_at(123, 1), "http://x.com/00123_1");

@@ -1,4 +1,6 @@
-use crate::dezoomer::*;
+use crate::dezoomer::{
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, ImageUrl, Images,
+};
 use custom_error::custom_error;
 
 custom_error! {pub BulkTextError
@@ -12,7 +14,7 @@ impl From<BulkTextError> for DezoomerError {
 }
 
 /// A dezoomer for text files containing lists of URLs
-/// Parses text files where each line is a URL and returns them as ZoomableImageUrl objects
+/// Parses text files where each line is a deferred image URL.
 #[derive(Default)]
 pub struct BulkTextDezoomer;
 
@@ -21,21 +23,14 @@ impl Dezoomer for BulkTextDezoomer {
         "bulk_text"
     }
 
-    fn zoom_levels(&mut self, _data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
-        // BulkTextDezoomer returns URLs that need further processing, not direct zoom levels
-        // This method is only provided for backward compatibility but will always error
-        Err(DezoomerError::DownloadError {
-            msg: "BulkTextDezoomer produces URLs that need further processing by other dezoomers. Use dezoomer_result() instead.".to_string()
-        })
-    }
-
-    fn dezoomer_result(&mut self, data: &DezoomerInput) -> Result<DezoomerResult, DezoomerError> {
+    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
         // Only process files that are actual bulk URL lists
         // Must have appropriate file extension or "bulk"/"list" in name
         // Exclude files with template variables like {{X}} or {{Y}} which are for generic dezoomer
-        let is_bulk_file = (data.uri.ends_with(".txt")
-            || data.uri.ends_with(".urls")
-            || data.uri.contains("bulk")
+        let extension = data.uri.rsplit('.').next();
+        let is_bulk_file = (extension.is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("urls")
+        }) || data.uri.contains("bulk")
             || data.uri.contains("list"))
             && !data.uri.contains("{{")
             && !data.uri.contains("}}");
@@ -45,7 +40,7 @@ impl Dezoomer for BulkTextDezoomer {
 
         // Parse the text content to extract URLs
         let content = std::str::from_utf8(contents).map_err(|e| DezoomerError::DownloadError {
-            msg: format!("Failed to parse text file as UTF-8: {}", e),
+            msg: format!("Failed to parse text file as UTF-8: {e}"),
         })?;
 
         let urls = parse_text_urls(content)?;
@@ -56,7 +51,7 @@ impl Dezoomer for BulkTextDezoomer {
             });
         }
 
-        Ok(dezoomer_result_from_urls(urls))
+        Ok(urls.into())
     }
 }
 
@@ -87,7 +82,7 @@ fn validate_url_or_path(input: &str, line_number: usize) -> Result<(), BulkTextE
 /// Each non-empty, non-comment line should start with a valid URL
 /// Optional custom title can be provided after the URL, separated by whitespace
 /// Format: URL [custom title]
-fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError> {
+fn parse_text_urls(content: &str) -> Result<Vec<ImageUrl>, BulkTextError> {
     let mut urls = Vec::new();
 
     for (line_num, line) in content.lines().enumerate() {
@@ -107,13 +102,12 @@ fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError
         validate_url_or_path(url_part, line_num + 1)?;
 
         // Use custom title if provided, otherwise extract from URL
-        let title = if let Some(custom_title) = custom_title {
-            Some(custom_title.to_string())
-        } else {
-            extract_title_from_url(url_part, line_num + 1)
-        };
+        let title = Some(custom_title.map_or_else(
+            || extract_title_from_url(url_part, line_num + 1),
+            str::to_string,
+        ));
 
-        urls.push(ZoomableImageUrl {
+        urls.push(ImageUrl {
             url: url_part.to_string(),
             title,
         });
@@ -123,7 +117,7 @@ fn parse_text_urls(content: &str) -> Result<Vec<ZoomableImageUrl>, BulkTextError
 }
 
 /// Extract a title from a URL for better identification
-fn extract_title_from_url(url: &str, line_number: usize) -> Option<String> {
+fn extract_title_from_url(url: &str, line_number: usize) -> String {
     // Try to extract filename from URL
     if let Ok(parsed_url) = url::Url::parse(url)
         && let Some(segments) = parsed_url.path_segments()
@@ -138,18 +132,22 @@ fn extract_title_from_url(url: &str, line_number: usize) -> Option<String> {
             };
 
             if !title.is_empty() {
-                return Some(title.to_string());
+                return title.to_string();
             }
         }
     }
 
     // Fallback to line number if we can't extract a good title
-    Some(format!("URL_{}", line_number))
+    format!("URL_{line_number}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dezoomer::{
+        PageContents,
+        test_utils::{assert_error_contains, expect_image_urls},
+    };
 
     #[test]
     fn test_parse_empty_content() {
@@ -203,35 +201,25 @@ mod tests {
     #[test]
     fn test_parse_invalid_url() {
         let content = "not_a_valid_url";
-        let result = parse_text_urls(content);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("line 1"));
-        assert!(error_msg.contains("not_a_valid_url"));
+        assert_error_contains(parse_text_urls(content), &["line 1", "not_a_valid_url"]);
     }
 
     #[test]
     fn test_extract_title_from_url() {
         assert_eq!(
             extract_title_from_url("http://example.com/image.jpg", 1),
-            Some("image".to_string())
+            "image"
         );
         assert_eq!(
             extract_title_from_url("https://example.org/path/manifest.json", 2),
-            Some("manifest".to_string())
+            "manifest"
         );
-        assert_eq!(
-            extract_title_from_url("http://example.com/", 3),
-            Some("URL_3".to_string())
-        );
-        assert_eq!(
-            extract_title_from_url("not_a_url", 4),
-            Some("URL_4".to_string())
-        );
+        assert_eq!(extract_title_from_url("http://example.com/", 3), "URL_3");
+        assert_eq!(extract_title_from_url("not_a_url", 4), "URL_4");
     }
 
     #[test]
-    fn test_dezoomer_result() {
+    fn test_images() {
         let mut dezoomer = BulkTextDezoomer;
         let content = "http://example.com/image1.jpg\nhttps://example.org/manifest.json".as_bytes();
 
@@ -240,25 +228,18 @@ mod tests {
             contents: PageContents::Success(content.to_vec()),
         };
 
-        let result = dezoomer.dezoomer_result(&input).unwrap();
-        assert_eq!(result.len(), 2);
-
-        // Check that they are ZoomableImage::ImageUrl variants
-        if let ZoomableImage::ImageUrl(ref url1) = result[0] {
-            assert_eq!(url1.url, "http://example.com/image1.jpg");
-        } else {
-            panic!("Expected ZoomableImage::ImageUrl");
-        }
-
-        if let ZoomableImage::ImageUrl(ref url2) = result[1] {
-            assert_eq!(url2.url, "https://example.org/manifest.json");
-        } else {
-            panic!("Expected ZoomableImage::ImageUrl");
-        }
+        let urls = expect_image_urls(dezoomer.images(&input).unwrap());
+        assert_eq!(
+            urls.iter().map(|url| url.url.as_str()).collect::<Vec<_>>(),
+            [
+                "http://example.com/image1.jpg",
+                "https://example.org/manifest.json"
+            ]
+        );
     }
 
     #[test]
-    fn test_dezoomer_result_empty_file() {
+    fn test_images_empty_file() {
         let mut dezoomer = BulkTextDezoomer;
         let content = "# Only comments\n\n# Nothing else".as_bytes();
 
@@ -267,18 +248,11 @@ mod tests {
             contents: PageContents::Success(content.to_vec()),
         };
 
-        let result = dezoomer.dezoomer_result(&input);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("No valid URLs found")
-        );
+        assert_error_contains(dezoomer.images(&input), &["No valid URLs found"]);
     }
 
     #[test]
-    fn test_dezoomer_result_invalid_url() {
+    fn test_images_invalid_url() {
         let mut dezoomer = BulkTextDezoomer;
         let content = "not_a_valid_url".as_bytes();
 
@@ -287,10 +261,6 @@ mod tests {
             contents: PageContents::Success(content.to_vec()),
         };
 
-        let result = dezoomer.dezoomer_result(&input);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("line 1"));
-        assert!(error_msg.contains("not_a_valid_url"));
+        assert_error_contains(dezoomer.images(&input), &["line 1", "not_a_valid_url"]);
     }
 }

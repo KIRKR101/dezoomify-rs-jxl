@@ -3,12 +3,15 @@ use std::sync::Arc;
 use custom_error::custom_error;
 use image_properties::{ImageProperties, ZoomLevelInfo};
 
-use crate::dezoomer::*;
+use crate::dezoomer::{
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
+    TilesRect, Vec2d, ZoomLevels,
+};
 
 mod image_properties;
 
 /// Dezoomer for the zoomify image format.
-/// See: http://zoomify.com/
+/// See: <http://zoomify.com/>
 #[derive(Default)]
 pub struct ZoomifyDezoomer;
 
@@ -17,11 +20,11 @@ impl Dezoomer for ZoomifyDezoomer {
         "zoomify"
     }
 
-    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
         self.assert(data.uri.contains("/ImageProperties.xml"))?;
         let DezoomerInputWithContents { uri, contents } = data.with_contents()?;
         let levels = load_from_properties(uri, contents)?;
-        Ok(levels)
+        Ok(levels.into())
     }
 }
 

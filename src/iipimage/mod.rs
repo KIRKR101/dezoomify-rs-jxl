@@ -1,7 +1,7 @@
 use crate::Vec2d;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, IntoZoomLevels, TilesRect,
-    ZoomLevels,
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
+    TilesRect,
 };
 use custom_error::custom_error;
 use regex::Regex;
@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// A dezoomer for krpano images
-/// See https://iipimage.sourceforge.io/documentation/protocol/
+/// See <https://iipimage.sourceforge.io/documentation/protocol/>
 #[derive(Default)]
 pub struct IIPImage;
 
@@ -23,11 +23,11 @@ impl Dezoomer for IIPImage {
         "IIPImage"
     }
 
-    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
         if data.uri.ends_with(META_REQUEST_PARAMS) {
             let DezoomerInputWithContents { uri, contents } = data.with_contents()?;
             let iter = iter_levels(uri, contents).map_err(DezoomerError::wrap)?;
-            Ok(iter.into_zoom_levels())
+            Ok(iter.into_zoom_levels().into())
         } else {
             let re = Regex::new("(?i)\\?FIF").unwrap();
             self.assert(re.is_match(&data.uri))?;
@@ -51,23 +51,18 @@ fn iter_levels(
 ) -> Result<impl Iterator<Item = Level> + 'static, IIPError> {
     let base = String::from(uri.trim_end_matches(META_REQUEST_PARAMS));
     let meta = Metadata::try_from(contents)?;
-    let levels =
-        (0..meta.levels)
-            .zip(arcs(base))
-            .zip(arcs(meta))
-            .map(|((level, base), metadata)| Level {
-                metadata,
-                base,
-                level,
-            });
+    let levels = (0..meta.levels)
+        .zip(arcs(base))
+        .zip(arcs(meta))
+        .map(|((index, base), info)| Level { info, base, index });
     Ok(levels)
 }
 
 #[derive(PartialEq, Eq)]
 struct Level {
-    metadata: Arc<Metadata>,
+    info: Arc<Metadata>,
     base: Arc<str>,
-    level: u32,
+    index: u32,
 }
 
 impl Debug for Level {
@@ -78,12 +73,12 @@ impl Debug for Level {
 
 impl TilesRect for Level {
     fn size(&self) -> Vec2d {
-        let reverse_level = self.metadata.levels - self.level - 1;
-        self.metadata.size / 2_u32.pow(reverse_level)
+        let reverse_level = self.info.levels - self.index - 1;
+        self.info.size / 2_u32.pow(reverse_level)
     }
 
     fn tile_size(&self) -> Vec2d {
-        self.metadata.tile_size
+        self.info.tile_size
     }
 
     fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
@@ -91,7 +86,7 @@ impl TilesRect for Level {
         format!(
             "{base}&JTL={level},{tile_index}",
             base = self.base,
-            level = self.level,
+            level = self.index,
             tile_index = y * width + x
         )
     }
@@ -108,7 +103,7 @@ impl FromStr for Metadata {
     type Err = IIPError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use IIPError::*;
+        use IIPError::MissingKey;
         let mut size = Err(MissingKey { key: "Max-size" });
         let mut tile_size = Err(MissingKey { key: "Tile-size" });
         let mut levels = Err(MissingKey {
@@ -123,16 +118,16 @@ impl FromStr for Metadata {
             let n2 = nums.next().flatten();
             if key.eq_ignore_ascii_case("max-size") {
                 if let (Some(x), Some(y)) = (n1, n2) {
-                    size = Ok(Vec2d { x, y })
+                    size = Ok(Vec2d { x, y });
                 }
             } else if key.eq_ignore_ascii_case("tile-size") {
                 if let (Some(x), Some(y)) = (n1, n2) {
-                    tile_size = Ok(Vec2d { x, y })
+                    tile_size = Ok(Vec2d { x, y });
                 }
             } else if key.eq_ignore_ascii_case("resolution-number")
                 && let Some(n) = n1
             {
-                levels = Ok(n)
+                levels = Ok(n);
             }
         }
         Ok(Metadata {
@@ -161,6 +156,7 @@ custom_error! {#[derive(PartialEq, Eq)] pub IIPError
 mod tests {
     use super::*;
     use crate::dezoomer::PageContents;
+    use crate::dezoomer::test_utils::expect_needs_data;
 
     #[test]
     fn test_lowercase() {
@@ -170,10 +166,7 @@ mod tests {
             uri,
             contents: PageContents::Unknown,
         };
-        match IIPImage.zoom_levels(&data) {
-            Err(DezoomerError::NeedsData { uri }) => assert_eq!(uri, metadata_uri),
-            _ => panic!("Unexpected result"),
-        }
+        assert_eq!(expect_needs_data(IIPImage.images(&data)), metadata_uri);
     }
 
     #[test]
@@ -185,22 +178,22 @@ mod tests {
             &levels,
             &[
                 Level {
-                    metadata: Arc::from(Metadata {
+                    info: Arc::from(Metadata {
                         size: Vec2d { x: 512, y: 512 },
                         tile_size: Vec2d { x: 256, y: 256 },
                         levels: 2,
                     }),
                     base: base.clone(),
-                    level: 0,
+                    index: 0,
                 },
                 Level {
-                    metadata: Arc::from(Metadata {
+                    info: Arc::from(Metadata {
                         size: Vec2d { x: 512, y: 512 },
                         tile_size: Vec2d { x: 256, y: 256 },
                         levels: 2,
                     }),
                     base,
-                    level: 1,
+                    index: 1,
                 }
             ]
         );
@@ -228,6 +221,6 @@ mod tests {
                 tile_size: Vec2d { x: 256, y: 256 },
                 levels: 9,
             })
-        )
+        );
     }
 }

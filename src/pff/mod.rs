@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use custom_error::custom_error;
 /// Dezoomer for the zoomify PFF servlet API format
-/// See: https://github.com/lovasoa/pff-extract/wiki/Zoomify-PFF-file-format-documentation
+/// See: <https://github.com/lovasoa/pff-extract/wiki/Zoomify-PFF-file-format-documentation>
 use serde_urlencoded as urlencoded;
 
 use image_properties::PffHeader;
 use image_properties::Reply;
 
-use crate::dezoomer::*;
+use crate::dezoomer::{
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, TilesRect, Vec2d,
+    ZoomLevel, ZoomLevels,
+};
 use crate::pff::image_properties::{
     HeaderInfo, ImageInfo, InitialServletRequestParams, RequestType, TileIndices,
 };
@@ -40,7 +43,7 @@ impl Dezoomer for PFF {
         "pff"
     }
 
-    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
         let mut parts = data.uri.splitn(2, '?');
         let base_url = parts
             .next()
@@ -80,7 +83,8 @@ impl Dezoomer for PFF {
                 Ok(zoom_levels(ImageInfo {
                     header_info: header_info.clone(),
                     tiles: reply.reply_data,
-                }))
+                })
+                .into())
             }
         }
     }

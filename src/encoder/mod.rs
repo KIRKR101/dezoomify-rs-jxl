@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use image::{DynamicImage, GenericImageView, Rgb, Rgba, SubImage};
 use log::debug;
 
-use crate::tile::Tile;
+use crate::tile::{EncodedTile, Tile};
 use crate::{Vec2d, ZoomError, max_size_in_rect};
 
 pub mod canvas;
@@ -13,10 +13,34 @@ pub mod pixel_streamer;
 pub mod png_encoder;
 mod retiler;
 pub mod tile_buffer;
+pub mod zif_tiff_encoder;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SourceLevel {
+    pub index: usize,
+    pub size: Vec2d,
+    pub scale_factor: u32,
+    pub tile_size: Option<Vec2d>,
+    pub has_overlapping_tiles: bool,
+}
 
 pub trait Encoder: Send + 'static {
+    /// Start writing a source pyramid level.
+    fn begin_level(&mut self, _level: SourceLevel) -> std::io::Result<()> {
+        Ok(())
+    }
     /// Add a tile to the image
     fn add_tile(&mut self, tile: Tile) -> std::io::Result<()>;
+    /// Add an encoded tile to the image without decoding it.
+    fn add_encoded_tile(&mut self, _tile: EncodedTile) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{} does not support encoded tile passthrough",
+                std::any::type_name::<Self>()
+            ),
+        ))
+    }
     /// To be called when no more tile will be added
     fn finalize(&mut self) -> std::io::Result<()>;
     /// Size of the image being encoded
@@ -46,13 +70,19 @@ fn encoder_for_name(
             size,
             quality,
         )?))
+    } else if extension == "tiff" || extension == "tif" || extension == "zif" {
+        debug!("Using the zif-tiff passthrough encoder");
+        Ok(Box::new(zif_tiff_encoder::ZifTiffEncoder::new(
+            destination,
+            size,
+        )?))
     } else if extension == "jpeg" || extension == "jpg" {
         debug!("Using the jpeg encoder with a quality of {quality}");
         Ok(Box::new(canvas::Canvas::<Rgb<u8>>::new_jpeg(
             destination,
             size,
             quality,
-        )?))
+        )))
     } else if extension == "jxl" {
         // JXL quality: scale compression so the default (5) produces files
         // smaller than equivalent JPEGs while maintaining competitive quality.
@@ -64,16 +94,16 @@ fn encoder_for_name(
             size,
             jxl_quality,
             effort,
-        )?))
+        )))
     } else {
         debug!(
             "Using the generic canvas implementation {}",
-            &destination.to_string_lossy()
+            destination.to_string_lossy()
         );
         Ok(Box::new(canvas::Canvas::<Rgba<u8>>::new_generic(
             destination,
             size,
-        )?))
+        )))
     }
 }
 
