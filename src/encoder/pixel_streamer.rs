@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::io::{self, Write};
 
 use image::{DynamicImage, GenericImageView, Pixel, Rgb, SubImage};
@@ -11,6 +10,7 @@ use crate::{Vec2d, max_size_in_rect};
 use std::sync::Arc;
 
 const BYTES_PER_PIXEL: usize = Rgb::<u8>::CHANNEL_COUNT as usize;
+static ZERO_BUF: [u8; 65536] = [0; 65536];
 
 /// A structure to which you write tiles, not necessarily in order,
 /// and that itself writes RGB pixels to its writer, ordered from top left to bottom right
@@ -33,8 +33,9 @@ impl<W: Write> PixelStreamer<W> {
 
     pub fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
         for strip in ImageStrip::in_tile(tile, self.size) {
-            let key = strip.pixel_index(self.size);
-            self.strips.insert(key, strip);
+            if let Some(key) = strip.pixel_index(self.size) {
+                self.strips.insert(key, strip);
+            }
         }
         self.advance(false)
     }
@@ -75,10 +76,16 @@ impl<W: Write> PixelStreamer<W> {
     /// Write blank pixels until the given pixel index
     pub fn fill_blank(&mut self, until: usize) -> io::Result<()> {
         if until > self.current_index {
-            let remaining = until - self.current_index;
-            debug!("Filling incomplete image with {remaining} pixels");
-            let blank = vec![0; remaining * BYTES_PER_PIXEL];
-            self.writer.write_all(&blank)?;
+            let mut remaining = (until - self.current_index) * BYTES_PER_PIXEL;
+            debug!(
+                "Filling incomplete image with {} blank pixels",
+                remaining / BYTES_PER_PIXEL
+            );
+            while remaining > 0 {
+                let chunk = remaining.min(ZERO_BUF.len());
+                self.writer.write_all(&ZERO_BUF[..chunk])?;
+                remaining -= chunk;
+            }
             self.current_index = until;
         }
         Ok(())
@@ -100,9 +107,11 @@ impl ImageStrip {
             .zip(0..height)
             .map(|(source, line)| ImageStrip { source, line })
     }
-    pub fn pixel_index(&self, image_size: Vec2d) -> usize {
+    pub fn pixel_index(&self, image_size: Vec2d) -> Option<usize> {
         let position = self.source.position + Vec2d { x: 0, y: self.line };
-        (position.y as usize) * (image_size.x as usize) + (position.x as usize)
+        (position.y as usize)
+            .checked_mul(image_size.x as usize)
+            .and_then(|base| base.checked_add(position.x as usize))
     }
     pub fn cropped(&self, image_size: Vec2d) -> SubImage<&DynamicImage> {
         crop_tile(&self.source, image_size)
@@ -118,7 +127,8 @@ impl ImageStrip {
         writer: &mut W,
     ) -> io::Result<()> {
         let img = self.cropped(image_size);
-        let x0 = u32::try_from(start_at).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let x0 = start_at.min(img.width() as usize) as u32;
         let pixel_count = (img.width() - x0) as usize;
         let mut line_buf = Vec::with_capacity(pixel_count * BYTES_PER_PIXEL);
         for x in x0..img.width() {
@@ -222,22 +232,21 @@ mod tests {
     #[test]
     fn tile0() {
         assert_state_after_tiles(
-            &[0], // Only the first line has been partially written
-            &[1, 2, 3, 4, 5, 6],
+            &[0],
+            vec![1, 2, 3, 4, 5, 6],
         );
     }
 
     #[test]
     fn tile1() {
-        // Nothing has been written on the top left
-        assert_state_after_tiles(&[1], &[]);
+        assert_state_after_tiles(&[1], vec![]);
     }
 
     #[test]
     fn tiles_0_and_1() {
         assert_state_after_tiles(
-            &[0, 1], // The first two lines now are written (tile 1 and the upper part of tile 2)
-            &[
+            &[0, 1],
+            vec![
                 1, 2, 3, 4, 5, 6, 00, 00, 00, 10, 10, 10, 7, 8, 9, 10, 11, 12, 01, 01, 01, 11, 11,
                 11,
             ],
@@ -247,31 +256,29 @@ mod tests {
     #[test]
     fn all_tiles() {
         assert_state_after_tiles(
-            &[0, 1, 2], // The whole image is written, in order
-            WHOLE_IMAGE,
+            &[0, 1, 2],
+            Vec::from(WHOLE_IMAGE),
         );
     }
 
     #[test]
     fn all_tiles_non_sorted() {
-        // The whole image is written, but not starting at the top left corner
-        assert_state_after_tiles(&[1, 2, 0], WHOLE_IMAGE);
-        assert_state_after_tiles(&[2, 1, 0], WHOLE_IMAGE);
+        assert_state_after_tiles(&[1, 2, 0], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[2, 1, 0], Vec::from(WHOLE_IMAGE));
     }
 
     #[test]
     fn all_tiles_overlapping_tiles() {
-        // The same tile is written multiple times
-        assert_state_after_tiles(&[0, 1, 0, 2], WHOLE_IMAGE);
-        assert_state_after_tiles(&[0, 0, 1, 1, 2, 2], WHOLE_IMAGE);
-        assert_state_after_tiles(&[2, 1, 2, 0], WHOLE_IMAGE);
-        assert_state_after_tiles(&[0, 1, 3, 2], WHOLE_IMAGE);
-        assert_state_after_tiles(&[0, 3, 1, 2], WHOLE_IMAGE);
-        assert_state_after_tiles(&[3, 0, 1, 2], WHOLE_IMAGE);
-        assert_state_after_tiles(&[0, 3, 0, 1, 2, 3], WHOLE_IMAGE);
+        assert_state_after_tiles(&[0, 1, 0, 2], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[0, 0, 1, 1, 2, 2], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[2, 1, 2, 0], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[0, 1, 3, 2], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[0, 3, 1, 2], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[3, 0, 1, 2], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[0, 3, 0, 1, 2, 3], Vec::from(WHOLE_IMAGE));
     }
 
-    fn assert_state_after_tiles(tile_indices: &[usize], expected: &[u8]) {
+    fn assert_state_after_tiles(tile_indices: &[usize], expected: Vec<u8>) {
         let mut out = vec![];
         let mut streamer = PixelStreamer::new(&mut out, Vec2d { x: 4, y: 4 });
         for &i in tile_indices {

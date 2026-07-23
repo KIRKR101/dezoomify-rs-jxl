@@ -57,6 +57,16 @@ before being able to launch it. See how to do
 ### Install via Homebrew
 As an alternative to installing the binary directly, on macOS and Linux dezoomify-rs is available via the [Homebrew package manager](https://brew.sh/). It can be installed with the command <code>brew install dezoomify-rs</code>.
 
+## Building from source
+
+If you build dezoomify-rs from source, JXL support requires the `vendored-jxl` feature:
+
+```sh
+cargo build --release --features vendored-jxl
+```
+
+Without this feature, `.jxl` output is unavailable but all other formats continue to work.
+
 ## Supported output image formats
 
 Dezoomify-rs supports multiple output image formats.
@@ -64,16 +74,17 @@ The format to use is determined by the name of the output file.
 For instance, entering `dezoomify-rs http://example.com/ my_image.png` on the command line
 will create a PNG image.
 
-Each image format encoder has a distinct set of features and limitations :
+Each image format encoder has a distinct set of features and limitations:
+ - **JPEG XL (JXL)** offers high fidelity at much smaller file sizes than PNG or JPEG.
+   It is the default format when no output extension is specified.
+   Use `--compression` to control quality (0–100) and `--jxl-effort` to control the encoding speed/effort (1–9).
+   The JXL encoder streams output directly to disk, so it can handle very large images.
  - **PNG** images are compressed losslessly, which means that the output image quality
-   is (very slightly) better than JPEG, at the expense of much larger file sizes. 
+   is (very slightly) better than JPEG, at the expense of much larger file sizes.
    The PNG encoder in dezoomify-rs can create very large images;
    it is not limited by the available memory on your computer.
-   This format is chosen by default when the image is very large,
-   or its size is not known in advance. 
  - **JPEG** is the most common image format.
     JPEG images cannot be more than 65,535 pixels wide or high.
-    This format is chosen be default for images that fit within this limit.
     The JPEG encoder in dezoomify-rs requires the whole image to fit in memory on your computer.
  - All formats [supported by image-rs](https://github.com/image-rs/image#21-supported-image-formats)
    are also supported.
@@ -222,7 +233,7 @@ Usage: dezoomify-rs [OPTIONS] [INPUT_URI] [OUTFILE]
 
 Arguments:
   [INPUT_URI]  Input URL or local file name. By default, the program will ask for it interactively
-  [OUTFILE]    File to which the resulting image should be saved. By default the program will generate a name based on the image metadata if available. Otherwise, it will generate a name in the format "dezoomified[_N].{jpg,png}" depending on which files already exist in the current directory, and whether the target image size fits in a JPEG or not
+  [OUTFILE]    File to which the resulting image should be saved. By default the program will generate a name based on the image metadata if available. Otherwise, it will generate a name in the format "dezoomified[_N].jxl"
 
 Options:
   -?, --help
@@ -246,7 +257,9 @@ Options:
       --retry-delay <RETRY_DELAY>
           Amount of time to wait before retrying a request that failed. Applies only to the first retry. Subsequent retries follow an exponential backoff strategy: each one is twice as long as the previous one [default: 2s]
       --compression <COMPRESSION>
-          A number between 0 and 100 expressing how much to compress the output image. For lossy output formats such as jpeg, this affects the quality of the resulting image. 0 means less compression, 100 means more compression. Currently affects only the JPEG and PNG encoders [default: 5]
+          A number between 0 and 100 expressing how much to compress the output image. For lossy output formats such as jpeg, this affects the quality of the resulting image. 0 means less compression, 100 means more compression. Currently affects the JPEG, PNG, and JXL encoders [default: 5]
+      --jxl-effort <JXL_EFFORT>
+          Encoding effort for JXL output (1–9). 1 = fastest / least compression, 9 = slowest / best compression. When not set, effort scales with --compression
   -H, --header <HEADERS>
           Sets an HTTP header to use on requests. This option can be repeated in order to set multiple headers. You can use `-H "Referer: URL"` where URL is the URL of the website's viewer page in order to let the site think you come from the legitimate viewer
       --max-idle-per-host <MAX_IDLE_PER_HOST>
@@ -265,6 +278,8 @@ Options:
           A place to store the image tiles when after they are downloaded and decrypted. By default, tiles are not stored to disk (which is faster), but using a tile cache allows retrying partially failed downloads, or stitching the tiles with an external program
       --bulk <BULK>
           URL or path to a text file containing a list of URLs to process in bulk mode. Each line in the file should contain one URL, optionally followed by a custom title. Format: URL [custom title] Lines starting with # are treated as comments and ignored. Accepts both local file paths and HTTP(S) URLs. Can also directly process IIIF manifests to download all images with enhanced metadata-based filenames. In bulk mode, if no level-specifying argument is defined (such as --max-width), then --largest is implied
+      --bulk-parallelism <BULK_PARALLELISM>
+          Number of images to process concurrently in bulk mode. 1 (the default) preserves the original sequential behavior [default: 1]
   -V, --version
           Print version
 ```

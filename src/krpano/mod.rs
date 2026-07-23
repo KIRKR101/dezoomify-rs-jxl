@@ -7,18 +7,16 @@ use log::debug;
 use log::warn;
 use regex::Regex;
 
-use krpano_metadata::{KrpanoMetadata, TemplateString, TemplateStringPart, XY};
-
-use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
-    PageContents, ResolvedImage, TileReference, TilesRect, Vec2d, ZoomLevels,
-};
-use crate::krpano::krpano_metadata::{ImageInfo, LevelDesc};
-use crate::network::resolve_relative;
 use krpano_decrypt::{decrypt_xml, is_encrypted_xml};
+use crate::krpano::krpano_metadata::{KrpanoMetadata, TemplateString, TemplateStringPart, XY, ImageInfo, LevelDesc};
 
-#[cfg(test)]
-use crate::dezoomer::test_utils::{expect_only, expect_resolved_images, expect_single_resolved};
+use crate::ZoomError;
+use crate::dezoomer::{
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, DezoomerResult,
+    IntoZoomLevels, PageContents, SimpleZoomableImage, TileReference, TilesRect, Vec2d,
+    ZoomLevels, ZoomableImageWithLevels, dezoomer_result_from_images,
+};
+use crate::network::resolve_relative;
 
 mod krpano_metadata;
 
@@ -57,9 +55,14 @@ impl Dezoomer for KrpanoDezoomer {
         "krpano"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, _data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+        Err(self.wrong_dezoomer())
+    }
+
+    fn dezoomer_result(&mut self, data: &DezoomerInput) -> Result<DezoomerResult, DezoomerError> {
         self.handle_input(data, |uri, contents| {
-            Ok(load_images_from_properties(uri, contents)?.into())
+            let images = load_images_from_properties(uri, contents)?;
+            Ok(dezoomer_result_from_images(images))
         })
     }
 }
@@ -641,7 +644,7 @@ impl From<KrpanoError> for DezoomerError {
 fn load_images_from_properties(
     url: &str,
     contents: &[u8],
-) -> Result<Vec<ResolvedImage>, DezoomerError> {
+) -> Result<Vec<Box<dyn ZoomableImageWithLevels>>, DezoomerError> {
     let decrypted;
     let contents = if is_encrypted_xml(contents) {
         decrypted = decrypt_xml(contents, None)?;
@@ -727,7 +730,7 @@ fn load_images_from_properties(
                 Some(title)
             };
 
-            ResolvedImage::new(levels, image_title)
+            Box::new(SimpleZoomableImage::new(levels, image_title)) as Box<dyn ZoomableImageWithLevels>
         })
         .collect::<Vec<_>>();
 
@@ -756,7 +759,7 @@ impl TilesRect for Level {
         self.tile_size
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
         use std::fmt::Write;
         let mut result = String::new();
         for part in &self.template.0 {
@@ -777,7 +780,7 @@ impl TilesRect for Level {
                 }
             }
         }
-        resolve_relative(&self.base_url, &result)
+        Ok(resolve_relative(&self.base_url, &result))
     }
 
     fn title(&self) -> Option<String> {
@@ -789,11 +792,11 @@ impl TilesRect for Level {
         }
     }
 
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
-        TileReference {
-            url: self.tile_url(pos),
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos,
-        }
+        })
     }
 }
 
@@ -803,6 +806,9 @@ impl std::fmt::Debug for Level {
         write!(f, "{}", parts.iter().filter(|s| !s.is_empty()).join(" "))
     }
 }
+
+#[cfg(test)]
+use crate::dezoomer::test_utils::*;
 
 #[test]
 fn test_cube() {
@@ -815,13 +821,13 @@ fn test_cube() {
             </level>
         </image>
         </krpano>"#.as_bytes(),
-    ).unwrap());
-    let mut levels = image.into_zoom_levels();
+    ));
+    let mut levels = image.into_zoom_levels().unwrap();
     assert_eq!(levels.len(), 6);
     assert_eq!(levels[0].size_hint(), Some(Vec2d { x: 1000, y: 100 }));
     assert_eq!(format!("{:?}", levels[0]), "Krpano Cube forward");
     assert_eq!(
-        levels[0].next_tiles(None),
+        levels[0].next_tiles(None).unwrap(),
         vec![
             TileReference {
                 url: "http://example.com/f/1/1.jpg".to_string(),
@@ -846,15 +852,14 @@ fn test_flat_multires() {
         </image>
         </krpano>"#
                 .as_bytes(),
-        )
-        .unwrap(),
+        ),
     );
-    let mut levels = image.into_zoom_levels();
+    let mut levels = image.into_zoom_levels().unwrap();
     assert_eq!(levels.len(), 2);
     assert_eq!(levels[1].size_hint(), Some(Vec2d { x: 3, y: 4 }));
     assert_eq!(format!("{:?}", levels[0]), "Krpano Flat");
     assert_eq!(
-        levels[1].next_tiles(None),
+        levels[1].next_tiles(None).unwrap(),
         vec![
             TileReference {
                 url: "http://test.com/level=2%20x=01%20y=01".to_string(),
@@ -910,8 +915,8 @@ fn assert_bellegambe_levels(levels: &ZoomLevels) {
 #[test]
 fn explicit_levels_expand_level_placeholder() {
     let data = std::fs::read("testdata/krpano/pba_lille_gigapixels_1515_bellegambe.xml").unwrap();
-    let image = expect_only(load_images_from_properties(BELLEGAMBE_XML_URL, &data).unwrap());
-    let levels = image.into_zoom_levels();
+    let image = expect_only(load_images_from_properties(BELLEGAMBE_XML_URL, &data));
+    let levels = image.into_zoom_levels().unwrap();
     assert_bellegambe_levels(&levels);
 }
 
@@ -922,8 +927,7 @@ fn explicit_levels_expand_level_placeholder_in_image() {
         uri: BELLEGAMBE_XML_URL.to_string(),
         contents: PageContents::Success(data),
     };
-    let image = expect_single_resolved(KrpanoDezoomer::default().images(&input).unwrap());
-    let levels = image.into_zoom_levels();
+    let levels = expect_single_resolved(KrpanoDezoomer::default().dezoomer_result(&input).unwrap());
     assert_bellegambe_levels(&levels);
 }
 
@@ -942,9 +946,9 @@ fn test_single_image() {
         contents: PageContents::Success(data.to_vec()),
     };
 
-    let image = expect_single_resolved(dezoomer.images(&input).unwrap());
-    assert_eq!(image.title(), None);
-    assert_eq!(image.levels().len(), 2);
+    let levels = expect_single_resolved(dezoomer.dezoomer_result(&input).unwrap());
+    assert_eq!(levels[0].title(), None);
+    assert_eq!(levels.len(), 2);
 }
 
 #[test]
@@ -963,9 +967,9 @@ fn test_cube_faces_form_one_image() {
         contents: PageContents::Success(data.to_vec()),
     };
 
-    let image = expect_single_resolved(dezoomer.images(&input).unwrap());
-    assert_eq!(image.title(), None);
-    assert_eq!(image.levels().len(), 6);
+    let levels = expect_single_resolved(dezoomer.dezoomer_result(&input).unwrap());
+    assert_eq!(levels[0].title(), None);
+    assert_eq!(levels.len(), 6);
 }
 
 #[test]
@@ -978,19 +982,22 @@ fn test_multiple_scenes_remain_separate() {
         contents: PageContents::Success(data),
     };
 
-    let images = expect_resolved_images(dezoomer.images(&input).unwrap());
-    let titles = images.iter().map(ResolvedImage::title).collect::<Vec<_>>();
+    let images = dezoomer.dezoomer_result(&input).unwrap();
+    let titles: Vec<_> = images.iter().map(|img| img.title().map(|c| c.into_owned())).collect();
     assert_eq!(
         titles,
         [
             Some(
                 " Saint Thomas (1618 - 1620) - Diego Velazquez - Museum of Fine Arts, Orleans ( France) scene_Color"
+                    .to_string(),
             ),
             Some(
                 " Saint Thomas (1618 - 1620) - Diego Velazquez - Museum of Fine Arts, Orleans ( France) scene_3D"
+                    .to_string(),
             ),
             Some(
                 " Saint Thomas (1618 - 1620) - Diego Velazquez - Museum of Fine Arts, Orleans ( France) scene_3Dcolor"
+                    .to_string(),
             ),
         ]
     );
@@ -1195,7 +1202,7 @@ fn viewer_js_is_detected_before_html_embed_markers() {
         contents: PageContents::Success(viewer_js.to_vec()),
     };
 
-    let err = dezoomer.images(&data).unwrap_err();
+    let err = dezoomer.dezoomer_result(&data).unwrap_err();
 
     assert!(matches!(
         err,
@@ -1218,7 +1225,7 @@ fn old_create_pano_viewer_js_is_detected_as_viewer_js() {
         contents: PageContents::Success(viewer_js.to_vec()),
     };
 
-    let err = dezoomer.images(&data).unwrap_err();
+    let err = dezoomer.dezoomer_result(&data).unwrap_err();
 
     assert!(matches!(
         err,

@@ -34,6 +34,15 @@ custom_error! {
     BufferToImage{source: BufferToImageError} = "{source}",
     WriteError{source: SendError<TileBufferMsg>} = "Unable to write tile {source:?}",
     PngError{source: png::EncodingError} = "PNG encoding error: {source}",
+    Cancelled = "Operation was cancelled",
+    NetworkUnavailable = "Network is not available",
+    TileUrl{source: TileUrlError} = "Invalid tile URL: {source}",
+}
+
+custom_error! {pub TileUrlError
+    InvalidTileNumber{ tile_number: usize, num_tiles: usize } =
+        "Invalid tile number {tile_number}, only {num_tiles} tiles are available",
+    Other{msg: String} = "{msg}",
 }
 
 impl From<reqwest::Error> for ZoomError {

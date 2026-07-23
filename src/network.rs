@@ -204,6 +204,10 @@ pub fn default_headers() -> HashMap<String, String> {
     serde_yaml::from_str(include_str!("default_headers.yaml")).unwrap()
 }
 
+pub async fn fetch_metadata_uri(uri: &str, http: &Client) -> Result<Vec<u8>, ZoomError> {
+    fetch_uri(uri, http).await
+}
+
 pub fn resolve_relative(base: &str, path: &str) -> String {
     if Url::parse(path).is_ok() {
         return path.to_string();

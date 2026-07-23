@@ -3,10 +3,8 @@ use std::sync::Arc;
 use custom_error::custom_error;
 use image_properties::{ImageProperties, ZoomLevelInfo};
 
-use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
-    TilesRect, Vec2d, ZoomLevels,
-};
+use crate::ZoomError;
+use crate::dezoomer::*;
 
 mod image_properties;
 
@@ -20,11 +18,10 @@ impl Dezoomer for ZoomifyDezoomer {
         "zoomify"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
-        self.assert(data.uri.contains("/ImageProperties.xml"))?;
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+        self.assert(data.uri.to_lowercase().contains("/imageproperties.xml"))?;
         let DezoomerInputWithContents { uri, contents } = data.with_contents()?;
-        let levels = load_from_properties(uri, contents)?;
-        Ok(levels.into())
+        Ok(load_from_properties(uri, contents)?)
     }
 }
 
@@ -40,11 +37,14 @@ impl From<ZoomifyError> for DezoomerError {
 
 fn load_from_properties(url: &str, contents: &[u8]) -> Result<ZoomLevels, ZoomifyError> {
     let image_properties: ImageProperties = serde_xml_rs::from_reader(contents)?;
-    let base_url_string = url
-        .split("/ImageProperties.xml")
-        .next()
-        .unwrap()
-        .to_string();
+    let lower_url = url.to_lowercase();
+    let marker = "/imageproperties.xml";
+    let base_url_string = if let Some(pos) = lower_url.find(marker) {
+        &url[..pos]
+    } else {
+        url
+    }
+    .to_string();
     let base_url = &Arc::from(base_url_string);
     let levels: Vec<ZoomLevelInfo> = image_properties.levels();
     let levels: ZoomLevels = levels
@@ -74,15 +74,15 @@ impl TilesRect for ZoomifyLevel {
         self.level_info.tile_size
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
-        format!(
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
+        Ok(format!(
             "{base}/TileGroup{group}/{z}-{x}-{y}.jpg",
             base = self.base_url,
             group = self.level_info.tile_group(pos),
             x = pos.x,
             y = pos.y,
             z = self.level
-        )
+        ))
     }
 
     fn title(&self) -> Option<String> {
@@ -115,7 +115,7 @@ fn test_panorama() {
     let mut props = load_from_properties(url, contents).unwrap();
     assert_eq!(props.len(), 11);
     let level = &mut props[3];
-    let tiles: Vec<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+    let tiles: Vec<String> = level.next_tiles(None).unwrap().into_iter().map(|t| t.url).collect();
     assert_eq!(
         tiles,
         vec![
@@ -137,7 +137,7 @@ fn test_tilegroups() {
                                 NUMTILES="2477" NUMIMAGES="1" VERSION="1.8" TILESIZE="256"/>"#;
     let mut props = load_from_properties(url, contents).unwrap();
     let level = &mut props[5];
-    let tiles: HashSet<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+    let tiles: HashSet<String> = level.next_tiles(None).unwrap().into_iter().map(|t| t.url).collect();
     assert!(tiles.contains("http://x.fr/y/TileGroup1/5-0-14.jpg"));
     assert!(tiles.contains("http://x.fr/y/TileGroup2/5-0-15.jpg"));
 }

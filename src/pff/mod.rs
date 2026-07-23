@@ -8,10 +8,8 @@ use serde_urlencoded as urlencoded;
 use image_properties::PffHeader;
 use image_properties::Reply;
 
-use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, TilesRect, Vec2d,
-    ZoomLevel, ZoomLevels,
-};
+use crate::ZoomError;
+use crate::dezoomer::*;
 use crate::pff::image_properties::{
     HeaderInfo, ImageInfo, InitialServletRequestParams, RequestType, TileIndices,
 };
@@ -43,7 +41,7 @@ impl Dezoomer for PFF {
         "pff"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
         let mut parts = data.uri.splitn(2, '?');
         let base_url = parts
             .next()
@@ -83,8 +81,7 @@ impl Dezoomer for PFF {
                 Ok(zoom_levels(ImageInfo {
                     header_info: header_info.clone(),
                     tiles: reply.reply_data,
-                })
-                .into())
+                }))
             }
         }
     }
@@ -128,10 +125,10 @@ impl TilesRect for PffZoomLevel {
         Vec2d { x: size, y: size }
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
         let num_tiles_x = (self.size().ceil_div(self.tile_size())).x;
         let i = self.tiles_before + pos.x + pos.y * num_tiles_x;
-        self.image_info.tile_url(i as usize)
+        Ok(self.image_info.tile_url(i as usize))
     }
 }
 

@@ -24,6 +24,8 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 custom_error = "1.7"
 clap = { version = "4.4.6", features = ["derive"] }
+tokio-util = { version = "0.7", features = ["full"] }
+lru = "0.12"
 evalexpr = "13"
 regex = "1"
 itertools = "0.15"

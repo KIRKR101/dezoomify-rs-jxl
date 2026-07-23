@@ -4,9 +4,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::Vec2d;
+use crate::errors::ZoomError;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, Images, TileFetchResult, TileProvider, TileReference,
-    single_level,
+    Dezoomer, DezoomerError, DezoomerInput, TileFetchResult, TileProvider, TileReference,
+    ZoomLevels, single_level,
 };
 
 mod dichotomy_2d;
@@ -22,7 +23,7 @@ impl Dezoomer for GenericDezoomer {
         "generic"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
         self.assert(TEMPLATE_RE.is_match(&data.uri))?;
         let dezoomer = ZoomLevel {
             url_template: data.uri.clone(),
@@ -32,7 +33,7 @@ impl Dezoomer for GenericDezoomer {
             tile_size: None,
             image_size: None,
         };
-        Ok(single_level(dezoomer).into())
+        single_level(dezoomer)
     }
 }
 
@@ -93,8 +94,11 @@ impl ZoomLevel {
 }
 
 impl TileProvider for ZoomLevel {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
-        if let Some(p) = previous {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
+        Ok(if let Some(p) = previous {
             self.tile_size = self.tile_size.or(p.tile_size);
             if let Some((x, y)) = self.dichotomy.next(p.is_success()) {
                 self.last_tile = (x, y);
@@ -118,7 +122,7 @@ impl TileProvider for ZoomLevel {
             }
         } else {
             vec![self.tile_ref_at(self.last_tile.0, self.last_tile.1)]
-        }
+        })
     }
     fn name(&self) -> String {
         format!("Generic image with template {}", self.url_template)
@@ -141,13 +145,13 @@ fn test_generic_dezoomer() {
     use std::collections::HashSet;
     let uri = "{{X}},{{Y}}".to_string();
     let images = GenericDezoomer {}
-        .images(&DezoomerInput {
+        .dezoomer_result(&DezoomerInput {
             uri,
             contents: PageContents::Unknown,
         })
         .unwrap();
-    let image = expect_single_resolved(images);
-    let mut lvl = image.into_zoom_levels().into_iter().next().unwrap();
+    let levels = expect_single_resolved(images);
+    let mut lvl = levels.into_iter().next().unwrap();
 
     let existing_tiles = ["0,0", "1,0", "2,0", "0,1", "1,1", "2,1"];
 
@@ -155,7 +159,7 @@ fn test_generic_dezoomer() {
 
     let mut zoom_level_iter = crate::dezoomer::ZoomLevelIter::new(&mut lvl);
     let mut tries = 0;
-    while let Some(tiles) = zoom_level_iter.next_tile_references() {
+    while let Some(tiles) = zoom_level_iter.next_tile_references().unwrap() {
         let count = tiles.len() as u64;
 
         let successes: Vec<_> = tiles

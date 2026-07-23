@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use tile_info::{PageInfo, TileInfo};
 
+use crate::ZoomError;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, Images, IntoZoomLevels, PostProcessFn, TileReference,
+    Dezoomer, DezoomerError, DezoomerInput, IntoZoomLevels, PostProcessFn, TileReference,
     TilesRect, Vec2d, ZoomLevels,
 };
 
@@ -24,7 +25,7 @@ impl Dezoomer for GAPDezoomer {
         "google_arts_and_culture"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
         // Allow Google Arts & Culture URLs or tile info URLs when we have page_info
         let is_valid_uri = data.uri.contains("artsandculture.google.com")
             || (self.page_info.is_some() && data.uri.ends_with("=g"));
@@ -57,10 +58,9 @@ impl Dezoomer for GAPDezoomer {
                     pyramid_level,
                     ..
                 } = serde_xml_rs::from_reader(contents).map_err(|e| {
+                    let preview = String::from_utf8_lossy(&contents[..contents.len().min(2048)]);
                     log::error!(
-                        "Failed to parse tile info XML: {}. Response was: {}",
-                        e,
-                        String::from_utf8_lossy(contents)
+                        "Failed to parse tile info XML: {e}. Response preview: {preview}"
                     );
                     DezoomerError::wrap(e)
                 })?;
@@ -92,7 +92,7 @@ impl Dezoomer for GAPDezoomer {
                         }
                     })
                     .into_zoom_levels();
-                Ok(levels.into())
+                Ok(levels)
             }
         }
     }
@@ -114,9 +114,9 @@ impl TilesRect for GAPZoomLevel {
         self.tile_size
     }
 
-    fn tile_url(&self, pos: Vec2d) -> String {
+    fn tile_url(&self, pos: Vec2d) -> Result<String, ZoomError> {
         let Vec2d { x, y } = pos;
-        url::compute_url(&self.page_info, x, y, self.z)
+        Ok(url::compute_url(&self.page_info, x, y, self.z))
     }
 
     fn post_process_fn(&self) -> PostProcessFn {
@@ -131,8 +131,8 @@ impl TilesRect for GAPZoomLevel {
 fn post_process_tile(
     _tile: &TileReference,
     data: Vec<u8>,
-) -> Result<Vec<u8>, Box<dyn Error + Send + 'static>> {
-    decryption::decrypt(data).map_err(|e| Box::new(e) as Box<dyn Error + Send + 'static>)
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync + 'static>> {
+    decryption::decrypt(data).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
 }
 
 impl std::fmt::Debug for GAPZoomLevel {
@@ -144,7 +144,7 @@ impl std::fmt::Debug for GAPZoomLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dezoomer::test_utils::{expect_needs_data, expect_single_resolved};
+    use crate::dezoomer::test_utils::expect_needs_data;
     use crate::dezoomer::{DezoomerInput, PageContents};
     use std::fs;
     use std::path::Path;
@@ -176,7 +176,7 @@ mod tests {
         };
 
         // First call should extract page info and request tile info URL
-        let uri = expect_needs_data(dezoomer.images(&input));
+        let uri = expect_needs_data(dezoomer.zoom_levels(&input));
         assert!(uri.ends_with("=g"));
         assert!(uri.contains("lh5.ggpht.com"));
 
@@ -204,7 +204,7 @@ mod tests {
         };
 
         // Second call should parse tile info and return zoom levels
-        let levels = expect_single_resolved(dezoomer.images(&input).unwrap()).into_zoom_levels();
+        let levels = dezoomer.zoom_levels(&input).unwrap();
         assert_eq!(levels.len(), 5); // Based on our test XML
 
         // Verify the largest level
@@ -223,7 +223,7 @@ mod tests {
             contents: PageContents::Success(page_html),
         };
 
-        let tile_info_uri = expect_needs_data(dezoomer.images(&input1));
+        let tile_info_uri = expect_needs_data(dezoomer.zoom_levels(&input1));
 
         // Step 2: Parse tile info
         let tile_info_xml = get_test_tile_info_xml();
@@ -232,7 +232,7 @@ mod tests {
             contents: PageContents::Success(tile_info_xml),
         };
 
-        let levels = expect_single_resolved(dezoomer.images(&input2).unwrap()).into_zoom_levels();
+        let levels = dezoomer.zoom_levels(&input2).unwrap();
         assert_eq!(levels.len(), 5);
 
         // Test that levels have the expected properties
@@ -252,7 +252,7 @@ mod tests {
             contents: PageContents::Success(vec![]),
         };
         // This will fail because contents are empty, but URL validation should pass
-        let result = dezoomer.images(&valid_input);
+        let result = dezoomer.zoom_levels(&valid_input);
         assert!(matches!(
             result,
             Err(DezoomerError::DownloadError { .. } | DezoomerError::Other { .. })
@@ -263,7 +263,7 @@ mod tests {
             uri: "https://example.com/test".to_string(),
             contents: PageContents::Success(vec![]),
         };
-        let result = dezoomer.images(&invalid_input);
+        let result = dezoomer.zoom_levels(&invalid_input);
         assert!(matches!(result, Err(DezoomerError::WrongDezoomer { .. })));
 
         // Should accept tile info URLs when page_info is set
@@ -278,7 +278,7 @@ mod tests {
             contents: PageContents::Success(vec![]),
         };
         // This will fail because contents are empty, but URL validation should pass
-        let result = dezoomer.images(&tile_info_input);
+        let result = dezoomer.zoom_levels(&tile_info_input);
         assert!(!matches!(result, Err(DezoomerError::WrongDezoomer { .. })));
     }
 
@@ -299,7 +299,7 @@ mod tests {
         };
 
         assert!(matches!(
-            dezoomer.images(&input),
+            dezoomer.zoom_levels(&input),
             Err(DezoomerError::Other { .. })
         ));
     }
@@ -319,7 +319,7 @@ mod tests {
             page_info: Arc::clone(&page_info),
         };
 
-        let tile_url = level.tile_url(Vec2d { x: 1, y: 1 });
+        let tile_url = level.tile_url(Vec2d { x: 1, y: 1 }).unwrap();
         assert!(tile_url.starts_with("https://lh5.ggpht.com/test"));
         assert!(tile_url.contains("=x1-y1-z2-t"));
 

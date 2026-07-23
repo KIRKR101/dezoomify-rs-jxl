@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::errors::ZoomError;
 use crate::TileReference;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, Images, TileFetchResult, TileProvider, Vec2d,
+    Dezoomer, DezoomerError, DezoomerInput, TileFetchResult, TileProvider, Vec2d, ZoomLevels,
     single_level,
 };
 use crate::network::default_headers;
@@ -21,12 +22,15 @@ impl Dezoomer for CustomDezoomer {
         "custom"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
-        self.assert(data.uri.ends_with("tiles.yaml"))?;
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+        self.assert(
+            data.uri.to_lowercase().ends_with("tiles.yaml")
+                || data.uri.to_lowercase().ends_with("tiles.yml"),
+        )?;
         let contents = data.with_contents()?.contents;
         let dezoomer: CustomYamlTiles =
             serde_yaml::from_slice(contents).map_err(DezoomerError::wrap)?;
-        Ok(single_level(dezoomer).into())
+        single_level(dezoomer)
     }
 }
 
@@ -48,16 +52,22 @@ impl std::fmt::Debug for CustomYamlTiles {
 }
 
 impl TileProvider for CustomYamlTiles {
-    fn next_tiles(&mut self, previous: Option<TileFetchResult>) -> Vec<TileReference> {
+    fn next_tiles(
+        &mut self,
+        previous: Option<TileFetchResult>,
+    ) -> Result<Vec<TileReference>, ZoomError> {
+        use crate::errors::ZoomError;
         if previous.is_some() {
-            return vec![];
+            return Ok(vec![]);
         }
         let tiles_result: Result<Vec<_>, _> = self.tile_set.into_iter().collect();
         match tiles_result {
-            Ok(tiles) => tiles,
+            Ok(tiles) => Ok(tiles),
             Err(err) => {
                 log::error!("Invalid tiles.yaml file: {err}\n");
-                vec![]
+                Err(ZoomError::Dezoomer {
+                    source: DezoomerError::Other { source: err.into() },
+                })
             }
         }
     }

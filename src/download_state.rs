@@ -13,6 +13,7 @@ use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::debug;
 use std::default::Default;
+use tokio_util::sync::CancellationToken;
 
 // --- DownloadState ---
 #[derive(Debug, Default)]
@@ -144,10 +145,15 @@ pub(crate) struct TileDownloadCoordinator<'a> {
     downloader: TileDownloader,
     throttler: Throttler,
     args: &'a Arguments,
+    cancel: CancellationToken,
 }
 
 impl<'a> TileDownloadCoordinator<'a> {
-    pub(crate) fn new(zoom_level: &ZoomLevel, args: &'a Arguments) -> Result<Self, ZoomError> {
+    pub(crate) fn new(
+        zoom_level: &ZoomLevel,
+        args: &'a Arguments,
+        cancel: CancellationToken,
+    ) -> Result<Self, ZoomError> {
         let downloader = create_tile_downloader(zoom_level, args)?;
         let throttler = Throttler::new(args.min_interval);
 
@@ -155,6 +161,7 @@ impl<'a> TileDownloadCoordinator<'a> {
             downloader,
             throttler,
             args,
+            cancel,
         })
     }
 
@@ -166,6 +173,9 @@ impl<'a> TileDownloadCoordinator<'a> {
         progress: &ProgressManager,
         zoom_level_iter: &ZoomLevelIter<'_>,
     ) -> Result<(), ZoomError> {
+        if self.cancel.is_cancelled() {
+            return Err(ZoomError::Cancelled);
+        }
         state.add_batch(tile_refs.len() as u64);
         progress.set_total_tiles(state.total_tiles); // Update progress bar length with cumulative total
         progress.set_requesting_tiles();
@@ -202,6 +212,9 @@ impl<'a> TileDownloadCoordinator<'a> {
             .buffer_unordered(self.args.parallelism);
 
         while let Some(tile_result) = stream.next().await {
+            if self.cancel.is_cancelled() {
+                return Err(ZoomError::Cancelled);
+            }
             debug!("Received tile result: {tile_result:?}");
             progress.increment();
 
@@ -249,6 +262,9 @@ impl<'a> TileDownloadCoordinator<'a> {
             .buffer_unordered(self.args.parallelism);
 
         while let Some(tile_result) = stream.next().await {
+            if self.cancel.is_cancelled() {
+                return Err(ZoomError::Cancelled);
+            }
             debug!("Received encoded tile result: {tile_result:?}");
             progress.increment();
 

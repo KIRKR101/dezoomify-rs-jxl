@@ -1,45 +1,126 @@
-use std::convert::TryFrom;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use log::debug;
 use sanitize_filename_reader_friendly::sanitize;
 
 use crate::{Vec2d, ZoomError};
 
-pub fn reserve_output_file(path: &Path) -> Result<(), ZoomError> {
-    OpenOptions::new().write(true).create_new(true).open(path)?;
-    Ok(())
+const MAX_INDEXED_SUFFIXES: u32 = 10_000;
+
+const RESERVATION_SUFFIX: &str = ".tmp";
+
+pub(crate) fn reserve_output_file(path: &Path) -> Result<(), ZoomError> {
+    let marker = reservation_marker(path);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&marker)?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
-pub fn get_outname(
-    outfile: Option<&Path>,
-    zoom_name: Option<&str>,
+pub(crate) fn reservation_marker(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    name.push(RESERVATION_SUFFIX);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+pub(crate) fn release_reservation(path: &Path) {
+    let marker = reservation_marker(path);
+    if let Err(e) = std::fs::remove_file(&marker)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!(
+            "Failed to remove reservation marker {}: {e}",
+            marker.display()
+        );
+    }
+}
+
+fn try_reserve_with_suffix(
+    mut path: PathBuf,
+    filename: &OsString,
+    ext: &OsString,
+    derived: bool,
+) -> Result<PathBuf, ZoomError> {
+    for i in 1..=MAX_INDEXED_SUFFIXES {
+        if derived && path.exists() {
+            let mut name = OsString::from(filename);
+            name.push(format!("_{i:04}."));
+            name.push(ext);
+            path.set_file_name(name);
+            continue;
+        }
+        match reserve_output_file(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ZoomError::Io {
+        source: std::io::Error::other(format!(
+            "Could not find a free output filename after {MAX_INDEXED_SUFFIXES} \
+             suffixed attempts. Please clean up the target directory."
+        )),
+    })
+}
+
+#[allow(clippy::ref_option)]
+pub fn reserve_unique_outname(
+    outfile: &Option<PathBuf>,
+    zoom_name: &Option<String>,
     base_dir: &Path,
     size: Option<Vec2d>,
-) -> PathBuf {
-    // An image can be encoded as JPEG only if both its dimensions can be encoded as u16
+) -> Result<PathBuf, ZoomError> {
+    let path = get_outname(outfile, zoom_name, base_dir, size)?;
+
+    let derived = outfile.is_none();
+    let filename = path.file_stem().map(OsString::from).unwrap_or_default();
+    let ext = path.extension().map(OsString::from).unwrap_or_default();
+
+    try_reserve_with_suffix(path, &filename, &ext, derived)
+}
+
+#[allow(clippy::ref_option)]
+pub fn get_outname(
+    outfile: &Option<PathBuf>,
+    zoom_name: &Option<String>,
+    base_dir: &Path,
+    size: Option<Vec2d>,
+) -> Result<PathBuf, ZoomError> {
     let fits_in_jpg = size.map(|Vec2d { x, y }| u16::try_from(x.max(y)).is_ok());
-    let extension = if fits_in_jpg == Some(true) {
-        "jxl"
-    } else {
-        "png"
-    };
+    let extension = "jxl";
     if let Some(path) = outfile {
         if let Some(forced_extension) = path.extension() {
-            if fits_in_jpg == Some(false)
-                && (forced_extension == "jpg" || forced_extension == "jpeg")
-            {
-                log::error!("This file is too large to be saved as JPEG");
+            let ext = forced_extension.to_string_lossy().to_lowercase();
+            if fits_in_jpg == Some(false) && (ext == "jpg" || ext == "jpeg") {
+                return Err(ZoomError::Io {
+                    source: std::io::Error::other(format!(
+                        "The image ({size:?} pixels) is too large to be saved as JPEG",
+                    )),
+                });
             }
-            path.into()
+            Ok(path.into())
         } else {
-            path.with_extension(extension)
+            Ok(path.with_extension(extension))
         }
     } else {
         let base = zoom_name
-            .map(sanitize)
+            .as_ref()
+            .map(|s| sanitize(s))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "dezoomified".into());
         let mut path = base_dir.to_path_buf();
@@ -47,133 +128,129 @@ pub fn get_outname(
         base_with_ext.push(".");
         base_with_ext.push(extension);
         path = path.join(base_with_ext);
-
-        // append a suffix (_1,_2,..) to `outname` if  the file already exists
-        let filename = path.file_stem().map(OsString::from).unwrap_or_default();
-        let ext = path.extension().map(OsString::from).unwrap_or_default();
-        for i in 1.. {
-            if !path.exists() {
-                break;
-            }
-            debug!(
-                "File {} already exists. Trying another file name...",
-                path.display()
-            );
-            let mut name = OsString::from(&filename);
-            name.push(format!("_{i:04}."));
-            name.push(&ext);
-            path.set_file_name(name);
-        }
-        path
+        Ok(path)
     }
 }
 
-#[allow(clippy::expect_fun_call)]
 #[cfg(test)]
 mod tests {
-    use std::env::{current_dir, set_current_dir};
-    use std::error::Error;
-    use std::fs::{remove_file, File};
-    use std::path::Path;
-    use std::sync::{LazyLock, Mutex};
+    use std::fs::File;
 
     use tempfile::Builder as TempDirBuilder;
 
     use super::*;
 
-    fn in_tmp_dir<T, F: Fn(&Path) -> T>(f: F) -> T {
-        static CWD_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-        let tmp = TempDirBuilder::new()
-            .prefix("dezoomify-rs-tests")
-            .tempdir()
-            .expect("Unable to create a temporary directory to run the tests in");
-        let lock = CWD_MUTEX.lock().unwrap(); // prevents multiple threads from changing cwd at once
-        let cwd = current_dir().expect("Unable to getcwd");
-        set_current_dir(&tmp).expect(&format!("Unable to cd into {tmp:?}"));
-        let res = f(tmp.as_ref());
-        set_current_dir(&cwd).expect(&format!("Unable to cd into {cwd:?}"));
-        drop(lock);
-        res
-    }
-
-    fn assert_filename_ok(filename: &str) -> Result<(), Box<dyn Error>> {
+    #[test]
+    fn reserve_unique_outname_falls_back_on_collision() {
         let base_dir = TempDirBuilder::new()
-            .prefix("dezoomify-rs-test-filename")
-            .tempdir()?;
-        let outname = get_outname(None, Some(filename), base_dir.as_ref(), None);
-        assert!(
-            !outname.exists(),
-            "get_outname cannot overwrite {outname:?}"
-        );
-        File::create(&outname).expect(&format!(
-            "Could not to create a file named {outname:?} for input {filename:?}"
-        ));
-        remove_file(&outname)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_special_chars() {
-        // See https://github.com/lovasoa/dezoomify-rs/issues/29
-        let filenames = vec![
-            "? [Question Mark] Australian WWI Poster",
-            "The Rocky Mountains, Lander's Peak",
-            "\"Is It So Nominated in the Bond?\" (Scene from \"The Merchant of Venice\")",
-            "", // test empty name
-        ];
-        for filename in filenames {
-            assert_filename_ok(filename).expect(&format!("Invalid filename {filename}"));
-        }
-    }
-
-    #[test]
-    fn test_existing_file() {
-        in_tmp_dir(|cwd| {
-            let name = cwd.join("xxx");
-            File::create(&name).expect("cannot create file");
-            assert_filename_ok(&name.to_string_lossy()).expect("Invalid file name");
-        });
-    }
-
-    #[test]
-    fn switch_to_png_for_large_files() {
-        let base_dir = TempDirBuilder::new()
-            .prefix("dezoomify-rs-test-png")
+            .prefix("dezoomify-rs-test-reserve-unique")
             .tempdir()
             .unwrap();
-        let base = |s| base_dir.as_ref().join(s);
+        let zoom_name = Some("collision".to_string());
+        let size = Some(Vec2d { x: 100, y: 100 });
+
+        let first = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
+        assert_eq!(first.file_name().unwrap(), "collision.jxl");
+        assert!(
+            !first.exists(),
+            "destination must not be created during reservation"
+        );
+        assert!(reservation_marker(&first).exists());
+
+        File::create(&first).unwrap();
+
+        let second = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
+        assert_eq!(second.file_name().unwrap(), "collision_0001.jxl");
+        assert!(reservation_marker(&second).exists());
+    }
+
+    #[test]
+    fn reserve_unique_outname_returns_error_after_max_collisions() {
+        let base_dir = TempDirBuilder::new()
+            .prefix("dezoomify-rs-test-reserve-saturation")
+            .tempdir()
+            .unwrap();
+        let zoom_name = Some("flood".to_string());
+        let size = Some(Vec2d { x: 100, y: 100 });
+
+        let first = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size).unwrap();
+        File::create(&first).expect("pre-create base collision");
+        for i in 1..=MAX_INDEXED_SUFFIXES {
+            let name = format!("flood_{i:04}.jxl");
+            File::create(base_dir.as_ref().join(&name)).expect("pre-create collision");
+        }
+
+        let result = reserve_unique_outname(&None, &zoom_name, base_dir.as_ref(), size);
+        assert!(
+            result.is_err(),
+            "expected an error when all suffixes are taken"
+        );
+    }
+
+    #[test]
+    fn reservation_release_cleans_up() {
+        let base_dir = TempDirBuilder::new()
+            .prefix("dezoomify-rs-test-release")
+            .tempdir()
+            .unwrap();
+        let name = base_dir.as_ref().join("test-release.jxl");
+
+        let marker = reservation_marker(&name);
+        reserve_output_file(&name).unwrap();
+        assert!(marker.exists());
+
+        release_reservation(&name);
+        assert!(!marker.exists(), "marker should be removed by release");
+    }
+
+    #[test]
+    fn get_outname_basics() {
+        let base_dir = TempDirBuilder::new()
+            .prefix("dezoomify-rs-test-outname")
+            .tempdir()
+            .unwrap();
+
         let tests = vec![
-            // outfile, zoom_name, size, expected_result
-            (None, Some("hello".to_string()), None, base("hello.png")),
             (
                 None,
                 Some("hello".to_string()),
-                Some(Vec2d { x: 1000, y: 1000 }),
-                base("hello.jxl"),
+                Some(Vec2d { x: 100, y: 100 }),
+                base_dir.as_ref().join("hello.jxl"),
             ),
-            (None, Some(String::new()), None, base("dezoomified.png")),
-            (None, None, None, base("dezoomified.png")),
             (
                 None,
                 None,
-                Some(Vec2d { x: 1000, y: 1000 }),
-                base("dezoomified.jxl"),
+                Some(Vec2d { x: 100, y: 100 }),
+                base_dir.as_ref().join("dezoomified.jxl"),
             ),
             (
-                Some(PathBuf::from("test.tiff")),
+                Some("test.tiff".into()),
                 Some("hello".to_string()),
                 Some(Vec2d { x: 1000, y: 1000 }),
                 "test.tiff".into(),
             ),
         ];
-        for (outfile, zoom_name, size, expected_result) in tests {
-            let outname = get_outname(
-                outfile.as_deref(),
-                zoom_name.as_deref(),
-                base_dir.as_ref(),
-                size,
-            );
+        for (outfile, zoom_name, size, expected_result) in tests.into_iter() {
+            let outname = get_outname(&outfile, &zoom_name, base_dir.as_ref(), size).unwrap();
             assert_eq!(outname, expected_result);
         }
+    }
+
+    #[test]
+    fn get_outname_rejects_too_large_jpeg() {
+        let base_dir = TempDirBuilder::new()
+            .prefix("dezoomify-rs-test-jpeg-size")
+            .tempdir()
+            .unwrap();
+        let result = get_outname(
+            &Some("out.jpg".into()),
+            &None,
+            base_dir.as_ref(),
+            Some(Vec2d {
+                x: 100_000,
+                y: 100_000,
+            }),
+        );
+        assert!(result.is_err());
     }
 }

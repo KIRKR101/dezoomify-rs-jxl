@@ -8,9 +8,10 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::Vec2d;
+use crate::ZoomError;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
-    TileReference, TilesRect,
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, IntoZoomLevels,
+    TileReference, TilesRect, ZoomLevels,
 };
 use crate::json_utils::number_or_string;
 
@@ -40,7 +41,7 @@ impl Dezoomer for NYPLImage {
     fn name(&self) -> &'static str {
         "nypl"
     }
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
         if data.uri.starts_with(NYPL_IMAGE_VIEW_PREFIX) {
             let image_view_url = data.uri.as_str();
             let image_id = parse_image_id(image_view_url).ok_or_else(|| {
@@ -54,7 +55,7 @@ impl Dezoomer for NYPLImage {
             self.assert(data.uri.contains(NYPL_META_PREFIX))?;
             let DezoomerInputWithContents { uri, contents } = data.with_contents()?;
             let iter = iter_levels(uri, contents).map_err(DezoomerError::wrap)?;
-            Ok(iter.into_zoom_levels().into())
+            Ok(iter.into_zoom_levels())
         }
     }
 }
@@ -112,26 +113,26 @@ impl TilesRect for Level {
         Vec2d::square(self.info.tile_size)
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
-        format!(
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
+        Ok(format!(
             "https://access.nypl.org/image.php/{id}/tiles/0/{level}/{x}_{y}.{format}",
             id = self.base,
             level = self.index,
             x = x,
             y = y,
             format = self.info.format,
-        )
+        ))
     }
 
-    fn tile_ref(&self, pos: Vec2d) -> TileReference {
+    fn tile_ref(&self, pos: Vec2d) -> Result<TileReference, ZoomError> {
         let delta = Vec2d {
             x: if pos.x == 0 { 0 } else { self.info.overlap },
             y: if pos.y == 0 { 0 } else { self.info.overlap },
         };
-        TileReference {
-            url: self.tile_url(pos),
+        Ok(TileReference {
+            url: self.tile_url(pos)?,
             position: self.tile_size() * pos - delta,
-        }
+        })
     }
 
     fn has_overlapping_tiles(&self) -> bool {
@@ -255,7 +256,7 @@ mod tests {
         let expected_url = "https://access.nypl.org/image.php/\
             a28d6e6b-b317-f008-e040-e00a1806635d\
             /tiles/0/12/0_0.png";
-        assert_eq!(level.tile_url(Vec2d { x: 0, y: 0 }), expected_url);
+        assert_eq!(level.tile_url(Vec2d { x: 0, y: 0 }).unwrap(), expected_url);
         assert_eq!(
             parse_image_id(
                 "https://digitalcollections.nypl.org/items/a14f3200-fac1-012f-f7a4-58d385a7bbd0#item-data"

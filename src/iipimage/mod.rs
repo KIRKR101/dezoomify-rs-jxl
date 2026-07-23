@@ -1,7 +1,8 @@
 use crate::Vec2d;
+use crate::ZoomError;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, Images, IntoZoomLevels,
-    TilesRect,
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, IntoZoomLevels, TilesRect,
+    ZoomLevels,
 };
 use custom_error::custom_error;
 use regex::Regex;
@@ -23,11 +24,11 @@ impl Dezoomer for IIPImage {
         "IIPImage"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
         if data.uri.ends_with(META_REQUEST_PARAMS) {
             let DezoomerInputWithContents { uri, contents } = data.with_contents()?;
             let iter = iter_levels(uri, contents).map_err(DezoomerError::wrap)?;
-            Ok(iter.into_zoom_levels().into())
+            Ok(iter.into_zoom_levels())
         } else {
             let re = Regex::new("(?i)\\?FIF").unwrap();
             self.assert(re.is_match(&data.uri))?;
@@ -81,14 +82,14 @@ impl TilesRect for Level {
         self.info.tile_size
     }
 
-    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> String {
+    fn tile_url(&self, Vec2d { x, y }: Vec2d) -> Result<String, ZoomError> {
         let Vec2d { x: width, .. } = self.size().ceil_div(self.tile_size());
-        format!(
+        Ok(format!(
             "{base}&JTL={level},{tile_index}",
             base = self.base,
             level = self.index,
             tile_index = y * width + x
-        )
+        ))
     }
 }
 
@@ -166,7 +167,7 @@ mod tests {
             uri,
             contents: PageContents::Unknown,
         };
-        assert_eq!(expect_needs_data(IIPImage.images(&data)), metadata_uri);
+        assert_eq!(expect_needs_data(IIPImage.zoom_levels(&data)), metadata_uri);
     }
 
     #[test]
@@ -198,11 +199,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            levels[0].tile_url(Vec2d { x: 0, y: 0 }),
+            levels[0].tile_url(Vec2d { x: 0, y: 0 }).unwrap(),
             "http://test.com/&JTL=0,0"
         );
         assert_eq!(
-            levels[1].tile_url(Vec2d { x: 0, y: 1 }),
+            levels[1].tile_url(Vec2d { x: 0, y: 1 }).unwrap(),
             "http://test.com/&JTL=1,2"
         );
     }

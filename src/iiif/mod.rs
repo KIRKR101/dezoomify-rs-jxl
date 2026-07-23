@@ -5,9 +5,11 @@ use log::{debug, warn};
 
 use tile_info::ImageInfo;
 
+use crate::ZoomError;
 use crate::dezoomer::{
-    Dezoomer, DezoomerError, DezoomerInput, ImageUrl, Images, IntoZoomLevels, ResolvedImage,
-    TilesRect, Vec2d, ZoomLevel, ZoomLevels,
+    Dezoomer, DezoomerError, DezoomerInput, DezoomerResult, IntoZoomLevels,
+    SimpleZoomableImage, TilesRect, Vec2d, ZoomLevel, ZoomLevels,
+    ZoomableImageUrl, dezoomer_result_from_single_image,
 };
 use crate::iiif::tile_info::TileSizeFormat;
 use crate::json_utils::all_json;
@@ -65,66 +67,55 @@ impl Dezoomer for IIIF {
         "iiif"
     }
 
-    fn images(&mut self, data: &DezoomerInput) -> Result<Images, DezoomerError> {
+    fn zoom_levels(&mut self, _data: &DezoomerInput) -> Result<ZoomLevels, DezoomerError> {
+        Err(self.wrong_dezoomer())
+    }
+
+    fn dezoomer_result(&mut self, data: &DezoomerInput) -> Result<DezoomerResult, DezoomerError> {
         let with_contents = data.with_contents()?;
         let contents = with_contents.contents;
         let uri = with_contents.uri;
 
-        // First, try to determine what type of IIIF content this is by doing a quick parse
-        // to check the "type" field without generating warnings
         if let Ok(quick_check) = serde_json::from_slice::<serde_json::Value>(contents)
             && let Some(type_value) = quick_check.get("type").or_else(|| quick_check.get("@type"))
             && let Some(type_str) = type_value.as_str()
         {
             match type_str {
                 "ImageService2" | "ImageService3" | "iiif:ImageProfile" => {
-                    // This is clearly an Image Service info.json, try parsing it directly
                     let levels = zoom_levels(uri, contents)?;
-                    let image = ResolvedImage::new(levels, None);
-                    return Ok(image.into());
+                    return Ok(dezoomer_result_from_single_image(
+                        SimpleZoomableImage::new(levels, None)
+                    ));
                 }
                 "Manifest" | "sc:Manifest" => {
-                    // This is clearly a manifest, try parsing it as such
                     match parse_iiif_manifest_from_bytes(contents, uri) {
                         Ok(image_infos) if !image_infos.is_empty() => {
                             return Ok(images_from_manifest_info(image_infos));
                         }
-                        Ok(_) => {
-                            // Empty image_infos, fall through to heuristic approach
-                        }
+                        Ok(_) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
-                _ => {
-                    // Unknown type, fall through to heuristic detection below
-                }
+                _ => {}
             }
         }
 
-        // If type detection didn't work or type is unknown, use heuristic approach
-        // Check if URL suggests it's an info.json file
-        if uri.ends_with("/info.json") {
-            // Likely an Image Service, try parsing as info.json first
-            if let Ok(levels) = zoom_levels(uri, contents) {
-                let image = ResolvedImage::new(levels, None);
-                return Ok(image.into());
+        if uri.ends_with("/info.json")
+            && let Ok(levels) = zoom_levels(uri, contents) {
+                return Ok(dezoomer_result_from_single_image(
+                    SimpleZoomableImage::new(levels, None)
+                ));
             }
-            // Fall through to try as manifest
-        }
 
-        // Try to parse as IIIF manifest
         match parse_iiif_manifest_from_bytes(contents, uri) {
             Ok(image_infos) if !image_infos.is_empty() => {
-                // Successfully parsed as manifest with images
                 Ok(images_from_manifest_info(image_infos))
             }
             _ => {
-                // Not a manifest or failed to parse as manifest, try as info.json
                 match zoom_levels(uri, contents) {
-                    Ok(levels) => {
-                        let image = ResolvedImage::new(levels, None);
-                        Ok(image.into())
-                    }
+                    Ok(levels) => Ok(dezoomer_result_from_single_image(
+                        SimpleZoomableImage::new(levels, None)
+                    )),
                     Err(e) => Err(e.into()),
                 }
             }
@@ -132,19 +123,19 @@ impl Dezoomer for IIIF {
     }
 }
 
-fn images_from_manifest_info(image_infos: Vec<manifest_types::ExtractedImageInfo>) -> Images {
-    let image_urls: Vec<ImageUrl> = image_infos
+fn images_from_manifest_info(image_infos: Vec<manifest_types::ExtractedImageInfo>) -> DezoomerResult {
+    let image_urls: Vec<ZoomableImageUrl> = image_infos
         .into_iter()
         .map(|image_info| {
             let title = determine_title(&image_info);
-            ImageUrl {
+            ZoomableImageUrl {
                 url: image_info.image_uri,
                 title,
             }
         })
         .collect();
 
-    image_urls.into()
+    crate::dezoomer::dezoomer_result_from_urls(image_urls)
 }
 
 fn zoom_levels(url: &str, raw_info: &[u8]) -> Result<ZoomLevels, IIIFError> {
@@ -237,12 +228,12 @@ impl TilesRect for IIIFZoomLevel {
         self.tile_size
     }
 
-    fn tile_url(&self, col_and_row_pos: Vec2d) -> String {
+    fn tile_url(&self, col_and_row_pos: Vec2d) -> Result<String, ZoomError> {
         let scaled_tile_size = self.tile_size * self.scale_factor;
         let xy_pos = col_and_row_pos * scaled_tile_size;
         let scaled_tile_size = max_size_in_rect(xy_pos, scaled_tile_size, self.page_info.size());
         let tile_size = scaled_tile_size / self.scale_factor;
-        format!(
+        Ok(format!(
             "{base}/{x},{y},{img_w},{img_h}/{tile_size}/{rotation}/{quality}.{format}",
             base = self
                 .page_info
@@ -261,7 +252,7 @@ impl TilesRect for IIIFZoomLevel {
             rotation = 0,
             quality = self.quality,
             format = self.format,
-        )
+        ))
     }
 
     fn scale_factor_hint(&self) -> Option<u32> {
@@ -449,6 +440,7 @@ fn test_tiles() {
     let mut levels = zoom_levels("test.com", data).unwrap();
     let tiles: Vec<String> = levels[6]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -474,6 +466,7 @@ fn test_tiles_max_area_filter() {
     let mut levels = zoom_levels("http://ophir.dev/info.json", data).unwrap();
     let tiles: Vec<String> = levels[0]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -497,6 +490,7 @@ fn test_missing_id() {
     let mut levels = zoom_levels("http://test.com/info.json", data).unwrap();
     let tiles: Vec<String> = levels[0]
         .next_tiles(None)
+        .unwrap()
         .into_iter()
         .map(|t| t.url)
         .collect();
@@ -543,7 +537,7 @@ fn test_qualities() {
     let mut levels = zoom_levels("test.com", data).unwrap();
     let level = &mut levels[0];
     assert_eq!(level.size_hint(), Some(Vec2d { x: 515, y: 381 })); // 5156/10, 3816/10
-    let tiles: Vec<String> = level.next_tiles(None).into_iter().map(|t| t.url).collect();
+        let tiles: Vec<String> = level.next_tiles(None).unwrap().into_iter().map(|t| t.url).collect();
     assert_eq!(
         tiles,
         vec![
@@ -764,7 +758,7 @@ mod manifest_parsing_tests {
             contents: PageContents::Success(manifest_data.to_vec()),
         };
 
-        let url = expect_single_url(dezoomer.images(&input).unwrap());
+        let url = expect_single_url(dezoomer.dezoomer_result(&input).unwrap());
         assert_eq!(url.url, "https://example.com/iiif/page1/info.json");
         assert_eq!(url.title.as_deref(), Some("Test Book - Page 1"));
     }
@@ -777,7 +771,7 @@ mod manifest_parsing_tests {
             contents: PageContents::Success(legacy_manifest_data().to_vec()),
         };
 
-        let url = expect_single_url(dezoomer.images(&input).unwrap());
+        let url = expect_single_url(dezoomer.dezoomer_result(&input).unwrap());
         assert_eq!(url.url, "https://example.com/iiif/page1/info.json");
         assert_eq!(url.title.as_deref(), Some("Legacy Book - Page 1"));
     }
@@ -802,8 +796,8 @@ mod manifest_parsing_tests {
             contents: PageContents::Success(info_data.to_vec()),
         };
 
-        let image = expect_single_resolved(dezoomer.images(&input).unwrap());
-        assert_eq!(image.title(), None);
-        assert_eq!(image.levels().len(), 3);
+        let levels = expect_single_resolved(dezoomer.dezoomer_result(&input).unwrap());
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0].title(), None);
     }
 }

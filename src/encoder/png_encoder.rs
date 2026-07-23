@@ -3,18 +3,25 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 
+use png::Filter as PngFilter;
+
 use crate::tile::Tile;
 use crate::{Vec2d, ZoomError};
 
 use super::Encoder;
 use super::pixel_streamer::PixelStreamer;
 
+const PNG_STREAM_BUF_SIZE: usize = 1024 * 1024;
+
 pub struct PngEncoder {
     pixel_streamer: Option<PixelStreamer<png::StreamWriter<'static, File>>>,
     file: Option<File>,
     compression: png::Compression,
+    filter: PngFilter,
     size: Vec2d,
-    first_tile: bool,
+    pending_tiles: Vec<Tile>,
+    icc_profile: Option<Vec<u8>>,
+    exif_metadata: Option<Vec<u8>>,
 }
 
 impl PngEncoder {
@@ -25,18 +32,21 @@ impl PngEncoder {
             .truncate(true)
             .open(destination)?;
 
-        let compression_level = match compression {
-            0..=19 => png::Compression::Fast,
-            20..=60 => png::Compression::Balanced,
-            _ => png::Compression::High,
+        let (compression_level, filter) = match compression {
+            0..=19 => (png::Compression::Fast, PngFilter::Sub),
+            20..=60 => (png::Compression::Balanced, PngFilter::Adaptive),
+            _ => (png::Compression::High, PngFilter::Adaptive),
         };
 
         Ok(PngEncoder {
             pixel_streamer: None,
             file: Some(file),
             compression: compression_level,
+            filter,
             size,
-            first_tile: true,
+            pending_tiles: Vec::new(),
+            icc_profile: None,
+            exif_metadata: None,
         })
     }
 
@@ -73,17 +83,19 @@ impl PngEncoder {
 
             let mut encoder = png::Encoder::with_info(file, info)?;
             encoder.set_compression(self.compression);
+            encoder.set_filter(PngFilter::Adaptive);
             encoder
                 .write_header()?
-                .into_stream_writer_with_size(128 * 1024)?
+                .into_stream_writer_with_size(PNG_STREAM_BUF_SIZE)?
         } else {
             let mut encoder = png::Encoder::new(file, self.size.x, self.size.y);
             encoder.set_color(png::ColorType::Rgb);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(self.compression);
+            encoder.set_filter(self.filter);
             encoder
                 .write_header()?
-                .into_stream_writer_with_size(128 * 1024)?
+                .into_stream_writer_with_size(PNG_STREAM_BUF_SIZE)?
         };
 
         self.pixel_streamer = Some(PixelStreamer::new(writer, self.size));
@@ -93,39 +105,55 @@ impl PngEncoder {
 
 impl Encoder for PngEncoder {
     fn add_tile(&mut self, tile: Tile) -> io::Result<()> {
-        if self.first_tile {
-            // Write header with metadata from first tile if available
-            let icc_profile = tile.icc_profile.as_ref();
-            let exif_metadata = tile.exif_metadata.as_ref();
-
-            if let Some(profile) = icc_profile {
-                log::debug!(
-                    "Using ICC profile from first tile (size: {} bytes)",
-                    profile.len()
-                );
-            }
-
-            if let Some(exif) = exif_metadata {
-                log::debug!(
-                    "Using EXIF metadata from first tile (size: {} bytes)",
-                    exif.len()
-                );
-            }
-
-            self.write_header_with_metadata(icc_profile, exif_metadata)?;
-            self.first_tile = false;
+        if let Some(ref profile) = tile.icc_profile
+            && self.icc_profile.is_none()
+        {
+            log::debug!(
+                "Capturing ICC profile from tile at {} (size: {} bytes)",
+                tile.position(),
+                profile.len()
+            );
+            self.icc_profile = Some(profile.clone());
+        }
+        if let Some(ref exif) = tile.exif_metadata
+            && self.exif_metadata.is_none()
+        {
+            log::debug!(
+                "Capturing EXIF metadata from tile at {} (size: {} bytes)",
+                tile.position(),
+                exif.len()
+            );
+            self.exif_metadata = Some(exif.clone());
         }
 
-        self.pixel_streamer
-            .as_mut()
-            .expect("tried to add a tile in a finalized image")
-            .add_tile(tile)
+        if let Some(ref mut pixel_streamer) = self.pixel_streamer {
+            pixel_streamer.add_tile(tile)?;
+        } else {
+            self.pending_tiles.push(tile);
+            if self.icc_profile.is_some() || self.exif_metadata.is_some() {
+                let icc_profile = self.icc_profile.clone();
+                let exif_metadata = self.exif_metadata.clone();
+                self.write_header_with_metadata(icc_profile.as_ref(), exif_metadata.as_ref())?;
+                let mut pixel_streamer = self.pixel_streamer.take().unwrap();
+                for pending in self.pending_tiles.drain(..) {
+                    pixel_streamer.add_tile(pending)?;
+                }
+                self.pixel_streamer = Some(pixel_streamer);
+            }
+        }
+        Ok(())
     }
 
     fn finalize(&mut self) -> io::Result<()> {
-        // If no tiles were added, write header without metadata
-        if self.first_tile {
-            self.write_header_with_metadata(None, None)?;
+        if self.pixel_streamer.is_none() {
+            let icc_profile = self.icc_profile.clone();
+            let exif_metadata = self.exif_metadata.clone();
+            self.write_header_with_metadata(icc_profile.as_ref(), exif_metadata.as_ref())?;
+            let mut pixel_streamer = self.pixel_streamer.take().unwrap();
+            for pending in self.pending_tiles.drain(..) {
+                pixel_streamer.add_tile(pending)?;
+            }
+            self.pixel_streamer = Some(pixel_streamer);
         }
 
         let mut pixel_streamer = self
