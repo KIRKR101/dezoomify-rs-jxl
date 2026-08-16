@@ -629,8 +629,8 @@ impl fmt::Display for TileReference {
     }
 }
 
-/// Helper functions for creating DezoomerResult from common types
-
+/// Helper functions for creating DezoomerResult from common types.
+///
 /// Convert a vector of ZoomableImageUrl to DezoomerResult
 pub fn dezoomer_result_from_urls(urls: Vec<ZoomableImageUrl>) -> DezoomerResult {
     urls.into_iter().map(ZoomableImage::ImageUrl).collect()

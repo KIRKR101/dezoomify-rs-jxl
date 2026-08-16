@@ -1,5 +1,5 @@
-/// Test utilities for dezoomer tests.
-/// Helpers to unwrap common result types in tests.
+//! Test utilities for dezoomer tests.
+//! Helpers to unwrap common result types in tests.
 
 use crate::dezoomer::{DezoomerError, DezoomerResult, ZoomLevels, ZoomableImage, ZoomableImageUrl};
 
@@ -42,15 +42,6 @@ pub fn expect_needs_data(result: Result<ZoomLevels, DezoomerError>) -> String {
         Err(DezoomerError::NeedsData { uri }) => uri,
         other => panic!("Expected NeedsData, got {:?}", other),
     }
-}
-
-pub fn expect_resolved_images(result: DezoomerResult) -> Vec<Box<dyn crate::dezoomer::ZoomableImageWithLevels>> {
-    result.into_iter().map(|img| {
-        match img {
-            ZoomableImage::Image(i) => i,
-            ZoomableImage::ImageUrl(_) => panic!("Expected resolved image, got URL"),
-        }
-    }).collect()
 }
 
 pub fn assert_error_contains(result: Result<DezoomerResult, DezoomerError>, msg: &str) {

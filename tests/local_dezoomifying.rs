@@ -242,7 +242,7 @@ impl<'a> Drop for TmpFile<'a> {
         let _ = std::fs::remove_file(&path);
         let mut tmp_path = path.clone().into_os_string();
         tmp_path.push(".tmp");
-        let _ = std::fs::remove_file(&PathBuf::from(tmp_path));
+        let _ = std::fs::remove_file(PathBuf::from(tmp_path));
     }
 }
 

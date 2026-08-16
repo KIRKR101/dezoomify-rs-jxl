@@ -141,7 +141,7 @@ impl Dezoomer for AutoDezoomer {
                     false
                 }
                 Err(DezoomerError::NeedsData { uri }) => {
-                    debug!("dezoomer '{}' requested to load {}", dezoomer.name(), &uri);
+                    debug!("dezoomer '{}' requested to load {}", dezoomer.name(), uri);
                     if !self.needs_uris.contains(&uri) {
                         self.needs_uris.push(uri);
                     }
@@ -188,7 +188,7 @@ impl Dezoomer for AutoDezoomer {
                     return Ok(result);
                 }
                 Err(DezoomerError::NeedsData { uri }) => {
-                    debug!("dezoomer '{}' requested to load {}", dezoomer.name(), &uri);
+                    debug!("dezoomer '{}' requested to load {}", dezoomer.name(), uri);
                     if !self.needs_uris.contains(&uri) {
                         self.needs_uris.push(uri);
                     }
