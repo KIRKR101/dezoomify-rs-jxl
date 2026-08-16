@@ -185,6 +185,28 @@ fn test_panorama() {
 }
 
 #[test]
+fn test_dezoomer_title_reaches_levels() {
+    let mut dezoomer = DziDezoomer;
+    let input = DezoomerInput {
+        uri: "http://x.fr/y/test.dzi".to_string(),
+        contents: PageContents::Success(
+            br#"
+        <Image
+          TileSize="256"
+          Overlap="2"
+          Format="jpg"
+          >
+          <Size Width="600" Height="300"/>
+          <DisplayRects></DisplayRects>
+        </Image>"#
+                .to_vec(),
+        ),
+    };
+    let levels = dezoomer.zoom_levels(&input).unwrap();
+    assert_eq!(levels[0].title(), Some("test".to_string()));
+}
+
+#[test]
 fn test_dzi_with_bom() {
     // See https://github.com/lovasoa/dezoomify-rs/issues/45
     // Trying to parse a file with a byte order mark

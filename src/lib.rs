@@ -24,14 +24,12 @@ use dezoomer::{Dezoomer, DezoomerError, DezoomerInput};
 use dezoomer::{ZoomLevel, ZoomLevelIter};
 pub use errors::ZoomError;
 use network::{client, fetch_metadata_uri};
-use output_file::get_outname;
 use tile::Tile;
 pub use vec2d::Vec2d;
 
 use crate::dezoomer::{DezoomerResult, PageContents, ZoomableImage};
 use crate::encoder::SourceLevel;
 use crate::encoder::tile_buffer::TileBuffer;
-use crate::output_file::reserve_output_file;
 use crate::output_file::reserve_unique_outname;
 
 mod arguments;
@@ -57,7 +55,6 @@ pub mod iipimage;
 mod json_utils;
 pub mod krpano;
 pub mod nypl;
-pub mod pff;
 mod throttler;
 pub mod zoomify;
 
@@ -153,6 +150,13 @@ fn level_picker(mut levels: Vec<ZoomLevel>) -> Result<ZoomLevel, ZoomError> {
 }
 
 fn choose_level(mut levels: Vec<ZoomLevel>, args: &Arguments) -> Result<ZoomLevel, ZoomError> {
+    if levels.iter().all(|level| level.size_hint().is_some()) {
+        levels.sort_by_key(|level| {
+            let size = level.size_hint().expect("all level sizes were checked");
+            u64::from(size.x) * u64::from(size.y)
+        });
+    }
+
     match levels.len() {
         0 => Err(ZoomError::NoLevels),
         1 => Ok(levels.swap_remove(0)),
@@ -661,6 +665,70 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[derive(Debug)]
+    struct PyramidTestLevel {
+        size: Option<Vec2d>,
+        tile_size: Option<Vec2d>,
+        overlaps: bool,
+    }
+
+    impl dezoomer::TileProvider for PyramidTestLevel {
+        fn next_tiles(
+            &mut self,
+            _previous: Option<dezoomer::TileFetchResult>,
+        ) -> Result<Vec<TileReference>, ZoomError> {
+            Ok(Vec::new())
+        }
+
+        fn size_hint(&self) -> Option<Vec2d> {
+            self.size
+        }
+
+        fn tile_size_hint(&self) -> Option<Vec2d> {
+            self.tile_size
+        }
+
+        fn has_overlapping_tiles(&self) -> bool {
+            self.overlaps
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestLevel(Vec2d);
+
+    impl dezoomer::TileProvider for TestLevel {
+        fn next_tiles(
+            &mut self,
+            _previous: Option<dezoomer::TileFetchResult>,
+        ) -> Result<Vec<TileReference>, ZoomError> {
+            Ok(Vec::new())
+        }
+
+        fn size_hint(&self) -> Option<Vec2d> {
+            Some(self.0)
+        }
+    }
+
+    fn test_levels(sizes: &[u32]) -> Vec<ZoomLevel> {
+        sizes
+            .iter()
+            .map(|&size| Box::new(TestLevel(Vec2d { x: size, y: size })) as ZoomLevel)
+            .collect()
+    }
+
+    fn pyramid_test_levels() -> Vec<ZoomLevel> {
+        [256, 512]
+            .into_iter()
+            .map(|size| {
+                Box::new(PyramidTestLevel {
+                    size: Some(Vec2d { x: size, y: size }),
+                    tile_size: Some(Vec2d { x: 256, y: 256 }),
+                    overlaps: false,
+                }) as ZoomLevel
+            })
+            .collect()
+    }
+
     #[test]
     fn test_parse_level_index() {
         assert_eq!(parse_level_index("0", 5), Some(0));
@@ -678,6 +746,22 @@ mod tests {
         assert_eq!(resolve_level_index(4, 5), 4); // Last valid index
         assert_eq!(resolve_level_index(10, 5), 4); // Out of bounds, use last
         assert_eq!(resolve_level_index(100, 3), 2); // Way out of bounds
+    }
+
+    #[test]
+    fn choose_level_indexes_levels_from_smallest_to_largest() {
+        let mut args = Arguments::default();
+        args.zoom_level = Some(0);
+        let selected = choose_level(test_levels(&[400, 100, 200]), &args).unwrap();
+        assert_eq!(selected.size_hint(), Some(Vec2d { x: 100, y: 100 }));
+
+        args.zoom_level = Some(1);
+        let selected = choose_level(test_levels(&[400, 100, 200]), &args).unwrap();
+        assert_eq!(selected.size_hint(), Some(Vec2d { x: 200, y: 200 }));
+
+        args.zoom_level = Some(10);
+        let selected = choose_level(test_levels(&[400, 100, 200]), &args).unwrap();
+        assert_eq!(selected.size_hint(), Some(Vec2d { x: 400, y: 400 }));
     }
 
     #[test]
@@ -762,6 +846,71 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn source_pyramid_requires_compatible_output_and_levels() {
+        let mut args = Arguments::default();
+        for extension in ["iiif", "tif", "tiff", "zif"] {
+            let path = PathBuf::from(format!("output.{extension}"));
+            assert!(can_dezoomify_source_pyramid(
+                &path,
+                &args,
+                &pyramid_test_levels()
+            ));
+        }
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.png"),
+            &args,
+            &pyramid_test_levels()
+        ));
+
+        args.largest = true;
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.tiff"),
+            &args,
+            &pyramid_test_levels()
+        ));
+        args.largest = false;
+        args.zoom_level = Some(0);
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.tiff"),
+            &args,
+            &pyramid_test_levels()
+        ));
+
+        let missing_size = vec![Box::new(PyramidTestLevel {
+            size: None,
+            tile_size: Some(Vec2d { x: 256, y: 256 }),
+            overlaps: false,
+        }) as ZoomLevel];
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.tiff"),
+            &Arguments::default(),
+            &missing_size
+        ));
+
+        let missing_tile_size = vec![Box::new(PyramidTestLevel {
+            size: Some(Vec2d { x: 512, y: 512 }),
+            tile_size: None,
+            overlaps: false,
+        }) as ZoomLevel];
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.tiff"),
+            &Arguments::default(),
+            &missing_tile_size
+        ));
+
+        let overlapping = vec![Box::new(PyramidTestLevel {
+            size: Some(Vec2d { x: 512, y: 512 }),
+            tile_size: Some(Vec2d { x: 256, y: 256 }),
+            overlaps: true,
+        }) as ZoomLevel];
+        assert!(!can_dezoomify_source_pyramid(
+            Path::new("output.tiff"),
+            &Arguments::default(),
+            &overlapping
+        ));
     }
 
     #[test]

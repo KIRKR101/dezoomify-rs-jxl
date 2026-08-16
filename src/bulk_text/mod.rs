@@ -1,6 +1,6 @@
 use crate::dezoomer::{
     Dezoomer, DezoomerError, DezoomerInput, DezoomerInputWithContents, DezoomerResult,
-    ZoomLevels, ZoomableImage, ZoomableImageUrl,
+    ZoomLevels, ZoomableImageUrl,
     dezoomer_result_from_urls,
 };
 use custom_error::custom_error;
@@ -191,6 +191,7 @@ fn extract_title_from_url(url: &str, line_number: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dezoomer::ZoomableImage;
     use crate::dezoomer::{
         PageContents,
         test_utils::{assert_error_contains, expect_image_urls},
@@ -287,7 +288,7 @@ mod tests {
         assert_eq!(
             urls.iter().map(|img| match img {
             ZoomableImage::ImageUrl(url) => url.url.as_str(),
-            _ => panic!("Expected ImageUrl"),
+            ZoomableImage::Image(_) => panic!("Expected ImageUrl"),
         }).collect::<Vec<_>>(),
             [
                 "http://example.com/image1.jpg",

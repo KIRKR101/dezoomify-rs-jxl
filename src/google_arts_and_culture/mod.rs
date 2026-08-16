@@ -243,6 +243,24 @@ mod tests {
     }
 
     #[test]
+    fn test_dezoomer_title_reaches_levels() {
+        let mut dezoomer = GAPDezoomer::default();
+
+        let input1 = DezoomerInput {
+            uri: "https://artsandculture.google.com/asset/test".to_string(),
+            contents: PageContents::Success(get_test_page_html()),
+        };
+        let tile_info_uri = expect_needs_data(dezoomer.zoom_levels(&input1));
+
+        let input2 = DezoomerInput {
+            uri: tile_info_uri,
+            contents: PageContents::Success(get_test_tile_info_xml()),
+        };
+        let levels = dezoomer.zoom_levels(&input2).unwrap();
+        assert!(levels[0].title().is_some());
+    }
+
+    #[test]
     fn test_url_validation() {
         let mut dezoomer = GAPDezoomer::default();
 

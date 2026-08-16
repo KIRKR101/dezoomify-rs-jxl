@@ -231,22 +231,19 @@ mod tests {
 
     #[test]
     fn tile0() {
-        assert_state_after_tiles(
-            &[0],
-            vec![1, 2, 3, 4, 5, 6],
-        );
+        assert_state_after_tiles(&[0], &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn tile1() {
-        assert_state_after_tiles(&[1], vec![]);
+        assert_state_after_tiles(&[1], &[]);
     }
 
     #[test]
     fn tiles_0_and_1() {
         assert_state_after_tiles(
             &[0, 1],
-            vec![
+            &[
                 1, 2, 3, 4, 5, 6, 00, 00, 00, 10, 10, 10, 7, 8, 9, 10, 11, 12, 01, 01, 01, 11, 11,
                 11,
             ],
@@ -255,36 +252,33 @@ mod tests {
 
     #[test]
     fn all_tiles() {
-        assert_state_after_tiles(
-            &[0, 1, 2],
-            Vec::from(WHOLE_IMAGE),
-        );
+        assert_state_after_tiles(&[0, 1, 2], WHOLE_IMAGE);
     }
 
     #[test]
     fn all_tiles_non_sorted() {
-        assert_state_after_tiles(&[1, 2, 0], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[2, 1, 0], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[1, 2, 0], WHOLE_IMAGE);
+        assert_state_after_tiles(&[2, 1, 0], WHOLE_IMAGE);
     }
 
     #[test]
     fn all_tiles_overlapping_tiles() {
-        assert_state_after_tiles(&[0, 1, 0, 2], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[0, 0, 1, 1, 2, 2], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[2, 1, 2, 0], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[0, 1, 3, 2], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[0, 3, 1, 2], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[3, 0, 1, 2], Vec::from(WHOLE_IMAGE));
-        assert_state_after_tiles(&[0, 3, 0, 1, 2, 3], Vec::from(WHOLE_IMAGE));
+        assert_state_after_tiles(&[0, 1, 0, 2], WHOLE_IMAGE);
+        assert_state_after_tiles(&[0, 0, 1, 1, 2, 2], WHOLE_IMAGE);
+        assert_state_after_tiles(&[2, 1, 2, 0], WHOLE_IMAGE);
+        assert_state_after_tiles(&[0, 1, 3, 2], WHOLE_IMAGE);
+        assert_state_after_tiles(&[0, 3, 1, 2], WHOLE_IMAGE);
+        assert_state_after_tiles(&[3, 0, 1, 2], WHOLE_IMAGE);
+        assert_state_after_tiles(&[0, 3, 0, 1, 2, 3], WHOLE_IMAGE);
     }
 
-    fn assert_state_after_tiles(tile_indices: &[usize], expected: Vec<u8>) {
+    fn assert_state_after_tiles(tile_indices: &[usize], expected: &[u8]) {
         let mut out = vec![];
         let mut streamer = PixelStreamer::new(&mut out, Vec2d { x: 4, y: 4 });
         for &i in tile_indices {
             streamer.add_tile(tiles(i)).unwrap();
         }
-        assert_eq!(&out, &expected); // Only the first line has been partially written
+        assert_eq!(&out, expected); // Only the first line has been partially written
     }
 
     #[test]

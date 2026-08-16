@@ -604,7 +604,7 @@ async fn test_bulk_mode_with_outfile_specified_still_uses_titles_in_naming() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_google_arts_and_culture_dezoomer_basic() {
-    use dezoomify_rs::dezoomer::{Dezoomer, DezoomerError, DezoomerInput, PageContents, ZoomLevels};
+    use dezoomify_rs::dezoomer::{Dezoomer, DezoomerError, DezoomerInput, PageContents};
     use dezoomify_rs::google_arts_and_culture::GAPDezoomer;
     use std::fs;
 

@@ -177,3 +177,18 @@ fn test_title_extraction_simple_path() {
     // Test fallback when no meaningful path is found
     assert_eq!(level.title(), Some("example.com".to_string()));
 }
+
+#[test]
+fn test_dezoomer_title_reaches_levels() {
+    let mut dezoomer = ZoomifyDezoomer;
+    let input = DezoomerInput {
+        uri: "http://example.com/images/manuscript123/ImageProperties.xml".to_string(),
+        contents: PageContents::Success(
+            br#"<IMAGE_PROPERTIES WIDTH="1000" HEIGHT="1000"
+                NUMTILES="25" NUMIMAGES="1" VERSION="1.8" TILESIZE="256"/>"#
+                .to_vec(),
+        ),
+    };
+    let levels = dezoomer.zoom_levels(&input).unwrap();
+    assert_eq!(levels[0].title(), Some("manuscript123".to_string()));
+}

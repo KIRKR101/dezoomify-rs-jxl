@@ -983,7 +983,7 @@ fn test_multiple_scenes_remain_separate() {
     };
 
     let images = dezoomer.dezoomer_result(&input).unwrap();
-    let titles: Vec<_> = images.iter().map(|img| img.title().map(|c| c.into_owned())).collect();
+    let titles: Vec<_> = images.iter().map(|img| img.title().map(std::borrow::Cow::into_owned)).collect();
     assert_eq!(
         titles,
         [

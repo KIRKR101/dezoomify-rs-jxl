@@ -8,6 +8,8 @@ use crate::dezoomer::{
     Dezoomer, DezoomerError, DezoomerInput, TileFetchResult, TileProvider, Vec2d, ZoomLevels,
     single_level,
 };
+#[cfg(test)]
+use crate::dezoomer::PageContents;
 use crate::network::default_headers;
 
 mod tile_set;
@@ -100,6 +102,18 @@ fn test_can_parse_example() {
         conf.http_headers().contains_key("Referer"),
         "There should be a referer in the example"
     );
+}
+
+#[test]
+fn test_dezoomer_title_reaches_levels() {
+    let mut dezoomer = CustomDezoomer;
+    let yaml_path = format!("{}/tiles.yaml", env!("CARGO_MANIFEST_DIR"));
+    let input = DezoomerInput {
+        uri: "http://example.com/tiles.yaml".to_string(),
+        contents: PageContents::Success(std::fs::read(yaml_path).unwrap()),
+    };
+    let levels = dezoomer.zoom_levels(&input).unwrap();
+    assert_eq!(levels[0].title(), Some("A Palace".to_string()));
 }
 
 #[test]

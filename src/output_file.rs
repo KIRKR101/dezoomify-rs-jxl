@@ -230,7 +230,7 @@ mod tests {
                 "test.tiff".into(),
             ),
         ];
-        for (outfile, zoom_name, size, expected_result) in tests.into_iter() {
+        for (outfile, zoom_name, size, expected_result) in tests {
             let outname = get_outname(&outfile, &zoom_name, base_dir.as_ref(), size).unwrap();
             assert_eq!(outname, expected_result);
         }
